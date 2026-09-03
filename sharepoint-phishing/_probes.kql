@@ -1,0 +1,101 @@
+// ============================================================================
+// _probes.kql — one-off schema probes for this chapter
+// ----------------------------------------------------------------------------
+// Run each block once in Advanced Hunting and note the answer next to it.
+// Queries reference these as P1..P9 in their headers. None change anything.
+// ============================================================================
+
+// ---- P1: EntraIdSignInEvents schema ------------------------------------------
+// Gates: incident/4 (country column name to restore geo context; confirm
+//        ErrorCode and RiskLevelDuringSignIn exist under these names).
+// EntraIdSignInEvents | getschema
+// ANSWER (YYYY-MM-DD): country column = ____________
+
+// ---- P2: EmailPostDeliveryEvents action vocabulary ----------------------------
+// Gates: incident/3 and detection/3 ("ZAP"/"delete" has-matching; also any
+//        future remediation-efficacy metrics).
+// EmailPostDeliveryEvents
+// | where Timestamp > ago(7d)
+// | summarize count() by ActionType, Action, ActionResult
+// ANSWER (YYYY-MM-DD): ____________
+
+// ---- P3: EmailDirection of internal SPO share notifications --------------------
+// Gates: incident/5 (its mail leg deliberately has no direction filter).
+//        Have a colleague share a file with you, then:
+// EmailEvents
+// | where Timestamp > ago(1d)
+// | where SenderFromAddress =~ "no-reply@sharepointonline.com"
+// | where Subject has "shared"
+// | project Timestamp, EmailDirection, Subject, RecipientEmailAddress
+// ANSWER (YYYY-MM-DD): internal shares classify as = ____________
+
+// ---- P4: CloudAppEvents AccountId shape for Exchange/SharePoint audit ----------
+// Gates: incident/4 (inbox-rule leg assumes AccountId carries the UPN;
+//        share-op leg assumes RawEventData.UserId does).
+// CloudAppEvents
+// | where Timestamp > ago(7d)
+// | where ActionType in ("New-InboxRule", "Set-InboxRule", "UpdateInboxRules")
+// | project Timestamp, ActionType, AccountId, AccountDisplayName, RawEventData
+// | take 10
+// ANSWER (YYYY-MM-DD): AccountId is UPN? ____________
+
+// ---- P5: CloudAppEvents mailbox-persistence action vocabulary ------------------
+// Gates: incident/4 (mailbox leg beyond inbox rules: forwarding via
+//        Set-Mailbox — parameter names expected as tokens in RawEventData —
+//        and permission grants under these ActionType names).
+// CloudAppEvents
+// | where Timestamp > ago(30d)
+// | where ActionType in ("Set-Mailbox", "Add-MailboxPermission",
+//                        "Add-RecipientPermission", "Remove-InboxRule",
+//                        "Disable-InboxRule")
+// | summarize count() by ActionType
+// | union (CloudAppEvents
+//     | where Timestamp > ago(30d)
+//     | where ActionType == "Set-Mailbox"
+//     | where RawEventData has_any ("ForwardingSmtpAddress", "ForwardingAddress",
+//                                   "DeliverToMailboxAndForward")
+//     | take 5 | project ActionType = strcat("fwd-sample: ", tostring(RawEventData)))
+// ANSWER (YYYY-MM-DD): action types present = ____________ fwd params visible? ____________
+
+// ---- P6: EntraIdSignInEvents SessionId population ------------------------------
+// Gates: incident/4 (session-anomaly leg: one SessionId seen from multiple
+//        IPs) and incident/6 (SessionId reuse as the stronger pivot than IP).
+//        If SessionId is blank in this tenant, both degrade to IP reasoning.
+// EntraIdSignInEvents
+// | where Timestamp > ago(7d)
+// | summarize Total = count(), WithSession = countif(isnotempty(SessionId))
+// ANSWER (YYYY-MM-DD): populated for ____ % of sign-ins
+
+// ---- P7: Entra audit vocabulary in CloudAppEvents ------------------------------
+// Gates: incident/4 and 3b — the auth-method, OAuth-consent and
+//        device-registration legs match ActionType strings that are NOT yet
+//        verified in this tenant. If the real strings differ, those legs
+//        return empty and FAIL SILENT. Compare output against the lists in 4.
+// CloudAppEvents
+// | where Timestamp > ago(30d)
+// | where ActionType has_any ("security info", "Consent", "PermissionGrant",
+//                             "service principal", "device", "password",
+//                             "application")
+// | summarize count() by Application, ActionType
+// | sort by count_ desc
+// ANSWER (YYYY-MM-DD): auth-method strings = ______ consent strings = ______
+//                      device strings = ______
+
+// ---- P8: UPN vs primary SMTP divergence ----------------------------------------
+// Gates: incident/4 and 3b (idMap / addrToUpn resolution). If UPN == primary
+//        SMTP for every account the resolution is a harmless no-op; where
+//        they diverge it is what keeps the mail legs from silently missing.
+// IdentityInfo
+// | where isnotempty(AccountUpn) and isnotempty(EmailAddress)
+// | summarize arg_max(Timestamp, EmailAddress) by AccountUpn
+// | summarize Accounts = count(),
+//             Diverging = countif(tolower(AccountUpn) != tolower(EmailAddress))
+// ANSWER (YYYY-MM-DD): ____ of ____ accounts diverge
+
+// ---- P9: UrlClickEvents.UrlChain population ------------------------------------
+// Gates: incident/7 section 1 (redirect chain recorded at click time — the
+//        cheapest source for the second-stage / harvest host).
+// UrlClickEvents
+// | where Timestamp > ago(7d)
+// | summarize Total = count(), WithChain = countif(isnotempty(UrlChain))
+// ANSWER (YYYY-MM-DD): populated? ____________

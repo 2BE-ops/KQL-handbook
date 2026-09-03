@@ -1,0 +1,134 @@
+// ============================================================================
+// incident/5 — CONTAIN INTERNAL SPREAD: the wave sent from OUR OWN tenant
+// FLOW     : 4's P0/P1 rows (copy PasteUpn cells) ─▶ THIS ─▶ select rows →
+//            Take actions → purge ─▶ 3a with the row's PasteKeys (own tenant
+//            + suspect sharer) to verify the purge ─▶ 3b (did eviction hold)
+// ----------------------------------------------------------------------------
+// Question : Every INTERNAL copy of the second-wave lure — mail carrying
+//            OUR-OWN-tenant SharePoint links shared or sent by a compromised
+//            account — one row per mailbox copy, ready to act on.
+// Modes    : SEEDED (normal): suspectUpns from 4/6 scope the wave precisely.
+//            DETECTOR (unseeded): any internal sharer whose share mail fans
+//            out to >= shareThreshold recipients in the window — a standing
+//            "is anyone spreading?" sweep. internalSharerAllowlist (sync from
+//            00-shared-lists) suppresses comms/HR/newsletter bulk sharers.
+// Surface  : Advanced Hunting, manual. Select rows → Take actions. Email
+//            actions light up because every row carries NetworkMessageId +
+//            RecipientEmailAddress — DO NOT add a summarize to this query;
+//            aggregation strips those columns and kills the action button
+//            (same rule as 2).
+// Tables   : EmailEvents, EmailUrlInfo, UrlClickEvents
+// Notes    : - The mail leg deliberately has NO EmailDirection filter:
+//              genuine SPO share notifications arrive from
+//              no-reply@sharepointonline.com and may classify as Inbound
+//              rather than Intra-org (probe P3, _probes.kql).
+//            - Suspect matching covers BOTH lure shapes: the /personal/
+//              sharer path segment (SPO-generated share mail) AND the sender
+//              address (mail sent directly by the compromised account).
+//            - FanOut carries the per-sharer evidence in either mode.
+// Inputs   : suspectUpns — PasteUpn cells from 4 (and 6). Empty = detector
+//            mode. shareThreshold — detector-mode fan-out gate.
+// Next     : purge ─▶ 3a (PasteKeys ready on every row) · clickers in these
+//            rows are new suspects ─▶ 4 ─▶ 3b
+// ============================================================================
+let lookback       = 7d;                  // up to 30d (AH retention cap)
+let shareThreshold = 15;                  // detector mode: internal fan-out worth flagging
+let suspectUpns    = dynamic([
+    // "user@contoso.com",   ← paste 4's / 6's PasteUpn cells; empty = detector mode
+]);
+let ownTenants     = dynamic(["contoso"]);
+// ---- sync from 00-shared-lists.kql ------------------------------------------
+let internalSharerAllowlist = dynamic([
+    // "internal.comms@contoso.com",
+]);
+let tenantPattern  = @"https?://([a-z0-9-]+?)(?:-my)?\.sharepoint\.com";
+let seeded = array_length(suspectUpns) > 0;
+// UPN -> lowercase address set, and -> /personal/ path segment set
+// (j.doe@contoso.com shares from /personal/j_doe_contoso_com/)
+let suspectAddrs = toscalar(
+    print Upn = suspectUpns
+    | mv-expand Upn to typeof(string)
+    | summarize make_set(tolower(Upn), 100));
+let suspectSegments = toscalar(
+    print Upn = suspectUpns
+    | mv-expand Upn to typeof(string)
+    | extend Seg = replace_regex(tolower(Upn), @"[@\.]", "_")
+    | summarize make_set(Seg, 100));
+let allowlistAddrs = toscalar(
+    print Upn = internalSharerAllowlist
+    | mv-expand Upn to typeof(string)
+    | summarize make_set(tolower(Upn), 100));
+let allowlistSegments = toscalar(
+    print Upn = internalSharerAllowlist
+    | mv-expand Upn to typeof(string)
+    | extend Seg = replace_regex(tolower(Upn), @"[@\.]", "_")
+    | summarize make_set(Seg, 100));
+//
+// ---- Internal-wave candidate mail: own-tenant SP links ----------------------
+let waveMsgs = materialize(
+    EmailUrlInfo
+    | where Timestamp > ago(lookback)
+    | where Url has "sharepoint.com"
+    | extend SharePointTenant = extract(tenantPattern, 1, tolower(Url))
+    | where SharePointTenant in (ownTenants)
+    | extend Sharer = extract(@"/personal/([^/]+)/", 1, tolower(Url))
+    | summarize SpUrl = take_any(Url), Sharer = take_any(Sharer),
+                SharePointTenant = take_any(SharePointTenant)
+              by NetworkMessageId
+    | join kind=inner (
+        EmailEvents
+        | where Timestamp > ago(lookback)
+        // no EmailDirection filter — see Notes / probe P3
+      ) on NetworkMessageId
+    | extend SenderLower = tolower(SenderFromAddress)
+);
+//
+// Per-sharer fan-out inside the window: the detector-mode gate, and the
+// evidence column in seeded mode
+let fanout = waveMsgs
+    | where isnotempty(Sharer)
+    | summarize FanOut = dcount(RecipientEmailAddress) by Sharer;
+//
+// Latest click per (message, clicker) — who opened the internal wave
+let recipientClicks =
+    UrlClickEvents
+    | where Timestamp > ago(lookback)
+    | where Workload == "Email"
+    | extend ClickUpn = tolower(AccountUpn)
+    | summarize arg_max(Timestamp, ActionType, IsClickedThrough)
+              by NetworkMessageId, ClickUpn
+    | project NetworkMessageId, ClickUpn,
+              ClickAction = ActionType, ClickedThrough = IsClickedThrough,
+              ClickTime = Timestamp;
+//
+waveMsgs
+| join kind=leftouter fanout on Sharer
+| extend FanOut = coalesce(FanOut, 0)
+// Gate: seeded = this suspect's wave only; detector = burst sharers minus
+// the allowlist. Seeded runs stay surgical — the detector gate is off.
+| where (seeded and (Sharer in (suspectSegments) or SenderLower in (suspectAddrs)))
+     or (not(seeded) and FanOut >= shareThreshold
+         and Sharer !in (allowlistSegments)
+         and SenderLower !in (allowlistAddrs))
+| extend RecipientKey = tolower(RecipientEmailAddress)
+| join kind=leftouter recipientClicks
+    on NetworkMessageId, $left.RecipientKey == $right.ClickUpn
+| extend Priority = case(
+    ClickedThrough == true,
+        "P0 - Clicked through the warning",
+    ClickAction == "ClickAllowed",
+        "P1 - Reached the lure",
+    LatestDeliveryLocation startswith "Inbox"
+        or (isempty(LatestDeliveryLocation) and DeliveryLocation startswith "Inbox"),
+        "P2 - Live in Inbox",
+    DeliveryAction == "Delivered",
+        "P3 - Delivered (since moved/junked)",
+        "P4 - Junked/blocked at delivery")
+// Ready-to-paste keys for 3a's internal-wave verification
+| extend PasteKeys = strcat('let targetTenant = "', SharePointTenant, '";',
+    iff(isnotempty(Sharer), strcat(' let targetSharer = "', Sharer, '";'), ''))
+| project Priority, PasteKeys, Timestamp, NetworkMessageId, RecipientEmailAddress,
+    Subject, SenderFromAddress, Sharer, FanOut, SharePointTenant,
+    DeliveryAction, DeliveryLocation, LatestDeliveryAction, LatestDeliveryLocation,
+    ClickAction, ClickedThrough, ClickTime, SpUrl
+| order by Priority asc, FanOut desc, Timestamp desc

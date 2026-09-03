@@ -1,0 +1,155 @@
+// ============================================================================
+// User Account — Suspicious Activity Summary (alert-driven)
+// Microsoft Defender XDR — Advanced Hunting
+// One row per user account, scored and enriched with surrounding evidence.
+//
+// Enabled/disabled state is resolved AFTER aggregation, as a tri-state value,
+// against three lookup keys, with the matching key surfaced in the output.
+// ============================================================================
+let Lookback        = 30d;                  // AlertInfo/AlertEvidence retain 30d
+let TargetUsers     = dynamic([]);
+let TitleExclusions = dynamic([]);          // noisy detections to suppress
+let W_High = 10; let W_Med = 5; let W_Low = 2; let W_Info = 1;
+let W_CategoryBreadth = 3;                  // points per distinct category (kill-chain breadth)
+//
+// --- Identity enrichment ----------------------------------------------------
+// Three keys, tried in descending order of trust: objectId > UPN > DOMAIN\sam.
+// Empty keys are filtered out of ALL of them: IdentityInfo rows sourced from
+// on-prem AD can carry an empty AccountObjectId, and AlertEvidence rows for
+// local/service accounts do too. "" == "" matches in KQL, so joining on an
+// unfiltered key stamps an arbitrary identity's enabled state onto unrelated
+// accounts — a wrong answer, not a missing one.
+let IdentityById =
+    IdentityInfo
+    | where Timestamp > ago(Lookback)
+    | where isnotempty(AccountObjectId)
+    | summarize arg_max(Timestamp, JobTitle, Department, IsAccountEnabled)
+        by AccountObjectId
+    | project AccountObjectId,
+              JT_id = JobTitle, Dept_id = Department,
+              En_id = IsAccountEnabled, Seen_id = Timestamp;
+let IdentityByUpn =
+    IdentityInfo
+    | where Timestamp > ago(Lookback)
+    | where isnotempty(AccountUpn)
+    | summarize arg_max(Timestamp, JobTitle, Department, IsAccountEnabled)
+        by Account = tolower(AccountUpn)
+    | project Account,
+              JT_upn = JobTitle, Dept_upn = Department,
+              En_upn = IsAccountEnabled, Seen_upn = Timestamp;
+let IdentityByDownlevel =
+    // Only fires if AlertEvidence and IdentityInfo agree on domain form
+    // (NetBIOS "CONTOSO" vs FQDN "contoso.com"). Costs nothing if it misses.
+    IdentityInfo
+    | where Timestamp > ago(Lookback)
+    | where isnotempty(AccountName) and isnotempty(AccountDomain)
+    | summarize arg_max(Timestamp, JobTitle, Department, IsAccountEnabled)
+        by Account = tolower(strcat(AccountDomain, @"\", AccountName))
+    | project Account,
+              JT_dl = JobTitle, Dept_dl = Department,
+              En_dl = IsAccountEnabled, Seen_dl = Timestamp;
+//
+let UserAlerts =
+    AlertEvidence
+    | where Timestamp > ago(Lookback)
+    | where EntityType == "User"
+    | extend Account = tolower(coalesce(
+          AccountUpn,
+          iff(isnotempty(AccountDomain) and isnotempty(AccountName),
+              strcat(AccountDomain, @"\", AccountName), AccountName)))
+    | where isnotempty(Account)
+    | where array_length(TargetUsers) == 0 or set_has_element(TargetUsers, Account)
+    | summarize AccountObjectId = take_anyif(AccountObjectId, isnotempty(AccountObjectId))
+      by AlertId, Account;
+let AlertContext =
+    AlertEvidence
+    | where Timestamp > ago(Lookback)
+    | where AlertId in ((UserAlerts | project AlertId))
+    | summarize
+        Devices   = make_set_if(DeviceName, EntityType == "Machine" and isnotempty(DeviceName), 25),
+        RemoteIPs = make_set_if(RemoteIP, isnotempty(RemoteIP), 25),
+        Urls      = make_set_if(RemoteUrl, isnotempty(RemoteUrl), 15),
+        Files     = make_set_if(FileName, EntityType == "File" and isnotempty(FileName), 15),
+        CmdLines  = make_set_if(ProcessCommandLine, isnotempty(ProcessCommandLine), 10),
+        OAuthApps = make_set_if(OAuthApplicationId, isnotempty(OAuthApplicationId), 10)
+      by AlertId;
+UserAlerts
+| join kind=inner (
+      AlertInfo
+      | where Timestamp > ago(Lookback)
+      | where not(Title in (TitleExclusions))
+  ) on AlertId
+| join kind=leftouter AlertContext on AlertId
+| extend AttackTechniques = iff(isempty(AttackTechniques) or AttackTechniques == "[]",
+                                '["(unmapped)"]', AttackTechniques)
+| mv-expand Technique = todynamic(AttackTechniques) to typeof(string)
+// --- all aggregates below are duplication-safe (dcount / min / max / make_set)
+| summarize
+      Alerts           = dcount(AlertId),
+      High             = dcountif(AlertId, Severity == "High"),
+      Medium           = dcountif(AlertId, Severity == "Medium"),
+      Low              = dcountif(AlertId, Severity == "Low"),
+      Informational    = dcountif(AlertId, Severity == "Informational"),
+      FirstAlert       = min(Timestamp),
+      LastAlert        = max(Timestamp),
+      DaysWithAlerts   = dcount(bin(Timestamp, 1d)),
+      Categories       = make_set(Category, 25),
+      Techniques       = make_set(Technique, 40),
+      AlertTitles      = make_set(Title, 40),
+      DetectionSources = make_set(DetectionSource, 15),
+      ServiceSources   = make_set(ServiceSource, 15),
+      Devices          = make_set(Devices, 25),
+      RemoteIPs        = make_set(RemoteIPs, 25),
+      Urls             = make_set(Urls, 15),
+      Files            = make_set(Files, 15),
+      CmdLines         = make_set(CmdLines, 10),
+      OAuthApps        = make_set(OAuthApps, 10),
+      // carried through so identity enrichment happens once per account,
+      // not once per alert row where take_any could land on a null
+      AccountObjectId  = take_anyif(AccountObjectId, isnotempty(AccountObjectId)),
+      AlertIds         = make_set(AlertId, 50)
+  by Account
+// make_set over an already-dynamic column nests arrays — flatten the key ones
+| mv-apply Devices   to typeof(dynamic) on (summarize Devices   = make_set(tostring(Devices)))
+| mv-apply RemoteIPs to typeof(dynamic) on (summarize RemoteIPs = make_set(tostring(RemoteIPs)))
+// --- resolve identity: objectId first, then UPN, then DOMAIN\sam ------------
+| join kind=leftouter IdentityById        on AccountObjectId
+| join kind=leftouter IdentityByUpn       on Account
+| join kind=leftouter IdentityByDownlevel on Account
+| extend
+      JobTitle     = coalesce(JT_id, JT_upn, JT_dl),
+      Department   = coalesce(Dept_id, Dept_upn, Dept_dl),
+      IdentityAsOf = coalesce(Seen_id, Seen_upn, Seen_dl)
+// Test the bool directly — no tostring() round-trip, no case-sensitivity risk.
+| extend AccountStatus = case(
+      isnotnull(En_id),  iff(En_id,  "Enabled", "DISABLED"),
+      isnotnull(En_upn), iff(En_upn, "Enabled", "DISABLED"),
+      isnotnull(En_dl),  iff(En_dl,  "Enabled", "DISABLED"),
+                         "Unknown — no IdentityInfo match")
+| extend IdentityMatchedOn = case(
+      isnotnull(En_id),  "objectId",
+      isnotnull(En_upn), "upn",
+      isnotnull(En_dl),  @"domain\sam",
+                         "none")
+| extend
+      DistinctDevices = array_length(Devices),
+      DistinctIPs     = array_length(RemoteIPs),
+      SpanHours       = round(datetime_diff('minute', LastAlert, FirstAlert) / 60.0, 1),
+      RiskScore       = (High * W_High) + (Medium * W_Med) + (Low * W_Low)
+                        + (Informational * W_Info)
+                        + (array_length(Categories) * W_CategoryBreadth)
+| extend Verdict = case(
+      High > 0 and array_length(Categories) >= 3, "Escalate — multi-stage, high severity",
+      High > 0,                                   "Escalate — high severity present",
+      RiskScore >= 25,                            "Investigate — sustained volume/breadth",
+      RiskScore >= 10,                            "Review",
+                                                  "Low priority")
+| extend Verdict = iff(AccountStatus == "DISABLED",
+                       strcat(Verdict, " — account now disabled"), Verdict)
+| project Account, AccountStatus, IdentityMatchedOn, Verdict, RiskScore,
+          Alerts, High, Medium, Low, Informational,
+          FirstAlert, LastAlert, SpanHours, DaysWithAlerts,
+          Categories, Techniques, AlertTitles, DetectionSources, ServiceSources,
+          DistinctDevices, Devices, DistinctIPs, RemoteIPs, Urls, Files, CmdLines,
+          OAuthApps, JobTitle, Department, IdentityAsOf, AccountObjectId, AlertIds
+| sort by RiskScore desc, LastAlert desc

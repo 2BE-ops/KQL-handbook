@@ -1,0 +1,87 @@
+// =====================================================================
+// Firewall flush hunting (Linux, MDE) — v4
+// Severity is now driven by WHAT was flushed, not who flushed it:
+//   - bare -F / --flush (no chain) or built-in chains  -> firewall dropped
+//   - nft flush ruleset                                 -> firewall dropped
+//   - unrecognized custom chain                         -> investigate
+//   - tunnel-tool chains (tailscale/sshuttle/wireguard) -> policy review
+//   - platform chains (docker/ufw/cni/lxc/kube/...)     -> self-management noise
+// Parent is a secondary signal: it only splits "interactive human dropped
+// the firewall" (1) from "service/script stopped the firewall" (2).
+// =====================================================================
+let Lookback = 30d;
+let FirewallBinaries = dynamic([
+    "iptables","ip6tables","iptables-nft","ip6tables-nft",
+    "iptables-legacy","ip6tables-legacy",
+    "xtables-nft-multi","xtables-legacy-multi","nft"]);
+DeviceProcessEvents
+| where Timestamp > ago(Lookback)
+| where FileName in~ (FirewallBinaries)
+| where ProcessCommandLine matches regex @"(^|\s)(-F|--flush)(\s|$)"
+     or (FileName =~ "nft" and ProcessCommandLine matches regex @"\bflush\s+(ruleset|table|chain)\b")
+| where InitiatingProcessFileName !~ "mde_netfilter"
+// --- Baseline exclusions: add verified device+pattern pairs here ---------
+// | where not(DeviceName startswith "netscanner-" and ProcessCommandLine has "-t raw")  // scanner-appliance NOTRACK reset — verify first, then uncomment
+// -------------------------------------------------------------------------
+// Extract the chain being flushed (empty = whole table). Chain names cannot
+// start with "-", so a following option like "--wait" is not captured.
+| extend FlushChain = iff(FileName =~ "nft",
+    extract(@"flush\s+(?:table|chain)\s+(?:ip6\s+|ip\s+|inet\s+|arp\s+|bridge\s+|netdev\s+)?([A-Za-z0-9_][A-Za-z0-9_\-\.]*)", 1, ProcessCommandLine),
+    extract(@"(?:^|\s)(?:-F|--flush)\s+([A-Za-z0-9_][A-Za-z0-9_\-\.]*)", 1, ProcessCommandLine))
+| extend ChainClass = case(
+    FileName =~ "nft" and ProcessCommandLine has "flush ruleset",        "FULL",
+    FileName !~ "nft" and isempty(FlushChain),                           "FULL",
+    FlushChain in~ ("INPUT","OUTPUT","FORWARD","PREROUTING","POSTROUTING"), "BUILTIN",
+    FlushChain startswith "ts-" or FlushChain startswith "sshuttle-"
+        or FlushChain startswith "wg-" or FlushChain =~ "tailscale",     "TUNNEL",
+    FlushChain startswith "DOCKER" or FlushChain startswith "ufw"        // covers ufw-*, ufw6-*
+        or FlushChain startswith "CNI-" or FlushChain startswith "KUBE-"
+        or FlushChain startswith "cali-" or FlushChain startswith "FLANNEL"
+        or FlushChain startswith "CILIUM" or FlushChain startswith "WEAVE"
+        or FlushChain startswith "LIBVIRT" or FlushChain startswith "f2b-"
+        or FlushChain in~ ("lxc","lxd","firewalld"),                     "PRODUCT",
+                                                                          "UNKNOWN")
+// Service/script context downgrades a full flush from "hands on keyboard"
+// to "firewall stopped via mechanism — verify intent"
+| extend ServiceContext =
+    InitiatingProcessFileName in~ ("systemd","systemd-executor","init")
+    or InitiatingProcessCommandLine has_any ("init.d","rc.d","netfilter-persistent","ufw-init","ifdown","ifup")
+| extend Severity = case(
+    ChainClass in ("FULL","BUILTIN") and not(ServiceContext), "1-Critical: firewall dropped (interactive/unknown origin)",
+    ChainClass in ("FULL","BUILTIN") and ServiceContext,      "2-High: firewall stopped via service/script - verify intent",
+    ChainClass == "UNKNOWN",                                  "3-Medium: flush of unrecognized chain",
+    ChainClass == "TUNNEL",                                   "4-Info: VPN/tunnel tool chain (policy review)",
+                                                              "5-Info: platform self-management")
+| summarize FlushCount = count(),
+            FirstSeen = min(Timestamp),
+            LastSeen = max(Timestamp),
+            Chains = make_set(FlushChain, 10),
+            SampleCommandLine = take_any(ProcessCommandLine),
+            SampleParentCommandLine = take_any(InitiatingProcessCommandLine)
+    by Severity, ChainClass, DeviceName, AccountName, InitiatingProcessFileName
+| sort by Severity asc, FlushCount desc
+// Detail mode: replace the summarize above with:
+// | project Timestamp, Severity, ChainClass, FlushChain, DeviceName, DeviceId,
+//           ReportId, AccountName, ProcessCommandLine, InitiatingProcessFileName,
+//           InitiatingProcessCommandLine, InitiatingProcessParentFileName,
+//           InitiatingProcessAccountName
+//
+// =====================================================================
+// COMPANION WATCH — firewall service stops
+// Chain-based severity correctly demotes UFW's per-chain teardown flushes
+// to Info, which means "someone stopped UFW" would no longer surface from
+// flush events alone. Catch the stop/disable action itself:
+// =====================================================================
+// DeviceProcessEvents
+// | where Timestamp > ago(30d)
+// | where ProcessCommandLine has_any (
+//         "ufw disable", "ufw-init stop",
+//         "systemctl stop ufw", "systemctl stop firewalld", "systemctl stop nftables",
+//         "systemctl disable ufw", "systemctl disable firewalld", "systemctl disable nftables",
+//         "service iptables stop", "init.d/iptables stop",
+//         "netfilter-persistent stop", "netfilter-persistent flush")
+// | where InitiatingProcessFileName !in~ ("wdavdaemon","mde_netfilter")   // MDE health checks
+// | project Timestamp, DeviceName, DeviceId, ReportId, AccountName,
+//           ProcessCommandLine, InitiatingProcessFileName,
+//           InitiatingProcessCommandLine, InitiatingProcessAccountName
+// | sort by Timestamp desc

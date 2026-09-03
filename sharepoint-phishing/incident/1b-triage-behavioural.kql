@@ -1,0 +1,281 @@
+// ============================================================================
+// incident/1B — TRIAGE (behavioural): per-tenant view for a CONFUSING picture
+// FLOW     : THIS ──copy PasteKeys (sharer auto-fills when unambiguous;
+//            else pick one from Sharers)──▶ 2-deep-dive
+// ----------------------------------------------------------------------------
+// Question : With thin/absent tenant lists and constant legitimate
+//            collaboration, which external tenants look like phish RIGHT NOW?
+//            One row per tenant that trips a gate.
+// How      : The original behavioural detector — runtime baselines
+//            (28d clean-receive, outbound partner corroboration, cold
+//            uploaders) plus burst / per-file fan-out / subject-repetition /
+//            lookalike / impersonation / click gates — with the final output
+//            rolled up per tenant for human triage.
+//            Heavier than 1A by design (four ~28d baseline scans); use 1A
+//            once the lists have matured.
+// MIRROR   : Detection logic must stay in sync with detection/
+//            0b-behavioural-rule.kql (the rule-shaped, per-recipient twin).
+// Surface  : Advanced Hunting, manual — during an incident or as the review
+//            when lists are immature. Scope: genuine SPO share-notification
+//            mail (no-reply@sharepointonline.com).
+// Tables   : EmailEvents x EmailUrlInfo x UrlClickEvents
+// Embeds   : trustedTenants, maliciousTenants (from 00-shared-lists)
+// ============================================================================
+// ---- Tunables ---------------------------------------------------------------
+let detection_window     = 1d;
+let baseline_window      = 28d;                                 // Defender AH cap is 30d
+let own_tenants          = dynamic(["contoso", "contoso-my"]);
+let own_tenant_string    = "contoso";
+let own_org_name_tokens  = dynamic(["contoso corporation", "contoso corp"]);
+let burst_recipients     = 20;
+let fanout_per_file      = 10;
+let pivoted_recipients   = 50;
+let pivoted_subj_repeat  = 10.0;
+let untrusted_subj_rep   = 20.0;
+let lookalike_threshold  = 0.85;
+// ---- Classification lists — sync from 00-shared-lists.kql -------------------
+let trustedTenants = dynamic([
+    "fabrikam", "adventureworks", "wingtiptoys"
+]);
+let maliciousTenants = dynamic([]);
+//
+// ---- Trusted SP tenants (28d clean-receive baseline) ------------------------
+let trusted_sp_tenants = toscalar(
+    EmailUrlInfo
+    | where Timestamp between (ago(baseline_window) .. ago(detection_window))
+    | where UrlDomain endswith ".sharepoint.com"
+    | extend SpTenant = extract(@"^([a-z0-9-]+?)(?:-my)?\.sharepoint\.com$", 1, tolower(UrlDomain))
+    | where isnotempty(SpTenant) and SpTenant !in (own_tenants)
+    | project NetworkMessageId, Timestamp, SpTenant
+    | join kind=inner hint.strategy=broadcast (
+        EmailEvents
+        | where Timestamp between (ago(baseline_window) .. ago(detection_window))
+        | where EmailDirection == "Inbound"
+        | where DeliveryAction == "Delivered"
+        | where isempty(ThreatTypes)
+        | project NetworkMessageId
+      ) on NetworkMessageId
+    | summarize CleanDays = dcount(startofday(Timestamp)) by SpTenant
+    | where CleanDays >= 3
+    | summarize make_set(SpTenant, 5000)
+);
+//
+// ---- Trusted partner organisations (outbound corroboration) ------------------
+let trusted_partner_domains = toscalar(
+    EmailEvents
+    | where Timestamp between (ago(baseline_window) .. ago(detection_window))
+    | where EmailDirection == "Outbound"
+    | where DeliveryAction in ("Delivered", "Junked")
+    | extend RecipientDomain = tolower(tostring(split(RecipientEmailAddress, "@")[1]))
+    | where isnotempty(RecipientDomain)
+    | summarize OutboundCount  = count(),
+                DistinctSenders = dcount(SenderFromAddress)
+              by RecipientDomain
+    | where OutboundCount >= 5 and DistinctSenders >= 2
+    | summarize make_set(RecipientDomain, 5000)
+);
+//
+// ---- Cold-uploader baseline ---------------------------------------------------
+let known_uploaders = toscalar(
+    EmailUrlInfo
+    | where Timestamp between (ago(baseline_window) .. ago(detection_window))
+    | where UrlDomain endswith ".sharepoint.com"
+    | extend ParsedPath    = tostring(parse_url(Url).Path)
+    | extend SpUploaderUpn = extract(@"/personal/([^/]+)/", 1, ParsedPath)
+    | where isnotempty(SpUploaderUpn)
+    | project NetworkMessageId, Timestamp, SpUploaderUpn
+    | join kind=inner hint.strategy=broadcast (
+        EmailEvents
+        | where Timestamp between (ago(baseline_window) .. ago(detection_window))
+        | where EmailDirection == "Inbound"
+        | where DeliveryAction == "Delivered"
+        | where isempty(ThreatTypes)
+        | project NetworkMessageId
+      ) on NetworkMessageId
+    | summarize SeenDays = dcount(startofday(Timestamp)) by SpUploaderUpn
+    | where SeenDays >= 1
+    | summarize make_set(SpUploaderUpn, 50000)
+);
+//
+// ---- Step 1: Pre-summarise SP URLs per message --------------------------------
+let SuspectMessages = materialize(
+    EmailUrlInfo
+    | where Timestamp > ago(detection_window)
+    | where UrlDomain endswith ".sharepoint.com"
+    | extend Host         = tolower(UrlDomain)
+    | extend SpTenant     = extract(@"^([a-z0-9-]+?)(?:-my)?\.sharepoint\.com$", 1, Host)
+    | extend IsPersonal   = Host endswith "-my.sharepoint.com"
+    | extend ParsedPath   = tostring(parse_url(Url).Path)
+    | extend SpUploaderUpn = extract(@"/personal/([^/]+)/", 1, ParsedPath)
+    | extend SpFileId     = extract(@"/personal/[^/]+/([A-Za-z0-9_-]{20,})", 1, ParsedPath)
+    | where isnotempty(SpTenant) and SpTenant !in (own_tenants)
+    | summarize SpUrls      = make_set(Url, 50),
+                SpTenants   = make_set(SpTenant, 5),
+                SpUploaders = make_set(SpUploaderUpn, 5),
+                SpFileIds   = make_set(SpFileId, 10),
+                SpUrlCount  = dcount(Url),
+                AnyPersonal = max(toint(IsPersonal))
+              by NetworkMessageId
+);
+//
+// ---- Step 2: Inbound mail scope ------------------------------------------------
+let CandidateMail = materialize(
+    EmailEvents
+    | where Timestamp > ago(detection_window)
+    | where EmailDirection == "Inbound"
+    | where SenderFromAddress     =~ "no-reply@sharepointonline.com"
+         or SenderMailFromAddress =~ "no-reply@sharepointonline.com"
+    | where DeliveryAction in ("Delivered", "Junked")
+    | where isnotempty(NetworkMessageId)
+        and NetworkMessageId != "00000000-0000-0000-0000-000000000000"
+    | join kind=inner hint.strategy=broadcast SuspectMessages on NetworkMessageId
+    | extend SpTenant      = tostring(SpTenants[0]),
+             SpUploaderUpn = tostring(SpUploaders[0]),
+             SpFileId      = tostring(SpFileIds[0]),
+             SpUrl         = tostring(SpUrls[0])
+    | extend SpDom2 = replace_string(trim_start("_", extract(@"_([a-z0-9-]+)_([a-z]{2,6})$",                           0, SpUploaderUpn)), "_", "."),
+             SpDom3 = replace_string(trim_start("_", extract(@"_([a-z0-9-]+)_([a-z0-9-]+)_([a-z]{2,6})$",              0, SpUploaderUpn)), "_", "."),
+             SpDom4 = replace_string(trim_start("_", extract(@"_([a-z0-9-]+)_([a-z0-9-]+)_([a-z0-9-]+)_([a-z]{2,6})$", 0, SpUploaderUpn)), "_", ".")
+    | extend SpCandDomains = pack_array(SpDom2, SpDom3, SpDom4)
+    | extend SpUploaderInferredDomain = coalesce(
+            tostring(set_intersect(SpCandDomains, trusted_partner_domains)[0]),
+            SpDom3, SpDom2)
+    | extend IsKnownMalicious = SpTenant in (maliciousTenants)
+    | extend IsTrustedTenant  = (SpTenant in (trusted_sp_tenants)
+                              or SpTenant in (trustedTenants)
+                              or SpUploaderInferredDomain in (trusted_partner_domains))
+                              and not(IsKnownMalicious)
+    | extend IsColdUploader   = isnotempty(SpUploaderUpn)
+                              and SpUploaderUpn !in (known_uploaders)
+    | extend IsImpersonatingOrg = Subject has_any (own_org_name_tokens)
+                               or tolower(Subject) contains own_tenant_string
+);
+//
+// ---- Step 3: Per-tenant burst / fan-out aggregation -----------------------------
+let TenantBurst = CandidateMail
+    | summarize Recipients      = dcount(RecipientEmailAddress),
+                UniqueUploaders = dcount(SpUploaderUpn),
+                UniqueSubjects  = dcount(Subject),
+                UniqueFiles     = dcount(SpFileId),
+                TotalDeliveries = count(),
+                FirstSeen       = min(Timestamp),
+                LastSeen        = max(Timestamp)
+              by SpTenant
+    | extend SubjectRepetition = todouble(TotalDeliveries) / todouble(UniqueSubjects);
+//
+// ---- Step 4: Per-FILE fan-out ----------------------------------------------------
+let FileFanOut = CandidateMail
+    | where isnotempty(SpFileId)
+    | summarize FileRecipients = dcount(RecipientEmailAddress)
+              by SpTenant, SpUploaderUpn, SpFileId
+    | summarize arg_max(FileRecipients, SpFileId) by SpTenant
+    | project SpTenant, MaxFileFanOut = FileRecipients, TopFileId = SpFileId;
+//
+// ---- Step 5: Lookalike-tenant booster --------------------------------------------
+let LookalikeTenants = CandidateMail
+    | distinct SpTenant
+    | extend OwnSet    = unicode_codepoints_from_string(own_tenant_string)
+    | extend TenantSet = unicode_codepoints_from_string(SpTenant)
+    | extend Inter     = toreal(array_length(set_intersect(OwnSet, TenantSet)))
+    | extend Uni       = toreal(array_length(set_union(OwnSet, TenantSet)))
+    | extend Similarity = iif(Uni == 0, 0.0, Inter / Uni)
+    | where Similarity >= lookalike_threshold and SpTenant !in (own_tenants)
+    | project SpTenant, Similarity;
+//
+// ---- Step 6: Click correlation -----------------------------------------------------
+let Clicks = UrlClickEvents
+    | where Timestamp > ago(detection_window)
+    | where Workload == "Email"
+    | where Url has "sharepoint.com"
+    | where ActionType in ("ClickAllowed", "ClickBlocked", "UrlErrorPage")
+         or IsClickedThrough == true
+    | where isnotempty(NetworkMessageId)
+        and NetworkMessageId != "00000000-0000-0000-0000-000000000000"
+    | summarize AnyClickAllowed = max(toint(ActionType == "ClickAllowed")),
+                AnyClickThrough = max(toint(IsClickedThrough == true))
+              by NetworkMessageId;
+//
+// ---- Step 7: Compose, gate, tier, ROLL UP PER TENANT --------------------------------
+CandidateMail
+| join kind=leftouter (TenantBurst | project SpTenant, Recipients, UniqueUploaders,
+                                             UniqueSubjects, UniqueFiles,
+                                             SubjectRepetition, TotalDeliveries)      on SpTenant
+| join kind=leftouter (FileFanOut    | project SpTenant, MaxFileFanOut, TopFileId)    on SpTenant
+| join kind=leftouter (LookalikeTenants | project SpTenant, LookalikeSimilarity = Similarity) on SpTenant
+| join kind=leftouter Clicks on NetworkMessageId
+| extend IsLookalike     = isnotempty(LookalikeSimilarity)
+| extend AnyClickAllowed = coalesce(AnyClickAllowed, 0),
+         AnyClickThrough = coalesce(AnyClickThrough, 0)
+//
+// Trigger gate (mirror of detection/0b)
+| where IsKnownMalicious == true
+     or (IsTrustedTenant == false and (
+            Recipients         >= burst_recipients
+         or MaxFileFanOut      >= fanout_per_file
+         or SubjectRepetition  >= untrusted_subj_rep
+         or IsLookalike        == true
+         or IsImpersonatingOrg == true
+         or (IsColdUploader == true and Recipients >= 5)
+         or AnyClickAllowed    == 1
+         or AnyClickThrough    == 1))
+     or (IsTrustedTenant == true  and (
+           (Recipients >= pivoted_recipients and SubjectRepetition >= pivoted_subj_repeat)
+         or AnyClickThrough == 1))
+//
+| extend Severity = case(
+    IsKnownMalicious == true and (AnyClickAllowed == 1 or AnyClickThrough == 1),
+        "P0-Critical",
+    IsKnownMalicious == true,
+        "P1-High",
+    AnyClickThrough == 1 and AnyClickAllowed == 1,
+        "P0-Critical",
+    AnyClickAllowed == 1,
+        "P1-High",
+    IsTrustedTenant == false and Recipients >= burst_recipients and MaxFileFanOut >= fanout_per_file,
+        "P1-High",
+    IsTrustedTenant == false and Recipients >= burst_recipients and IsImpersonatingOrg == true,
+        "P1-High",
+    IsTrustedTenant == false and Recipients >= burst_recipients and IsColdUploader == true,
+        "P1-High",
+    IsTrustedTenant == false and SubjectRepetition >= untrusted_subj_rep and Recipients >= burst_recipients,
+        "P1-High",
+    IsLookalike == true,
+        "P1-High",
+    IsTrustedTenant == true and Recipients >= pivoted_recipients,
+        "P1-High",
+    Recipients >= burst_recipients,
+        "P2-Medium",
+    "P3-Low")
+//
+// One row per tenant for triage (copy PasteKeys into 2)
+| summarize
+    Severity          = min(Severity),
+    Recipients        = take_any(Recipients),
+    TotalDeliveries   = take_any(TotalDeliveries),
+    UniqueUploaders   = take_any(UniqueUploaders),
+    UniqueSubjects    = take_any(UniqueSubjects),
+    UniqueFiles       = take_any(UniqueFiles),
+    SubjectRepetition = take_any(SubjectRepetition),
+    MaxFileFanOut     = take_any(MaxFileFanOut),
+    TopFileId         = take_any(TopFileId),
+    IsKnownMalicious  = max(toint(IsKnownMalicious)),
+    IsTrustedTenant   = take_any(IsTrustedTenant),
+    IsLookalike       = max(toint(IsLookalike)),
+    ColdUploaderMsgs  = countif(IsColdUploader),
+    ImpersonationMsgs = countif(IsImpersonatingOrg),
+    AnyClickAllowed   = max(AnyClickAllowed),
+    AnyClickThrough   = max(AnyClickThrough),
+    AlertRows         = count(),
+    Sharers           = make_set(SpUploaderUpn, 10),
+    SampleSubjects    = make_set(Subject, 10),
+    SampleUrls        = make_set(SpUrl, 5),
+    FirstSeen         = min(Timestamp),
+    LastSeen          = max(Timestamp)
+    by SpTenant
+// Ready-to-paste keys for 2/3/4 — sharer auto-fills only when there is
+// exactly one (unambiguous); otherwise pick from Sharers manually
+| extend PasteKeys = strcat('let targetTenant = "', SpTenant, '";',
+    iff(array_length(Sharers) == 1,
+        strcat(' let targetSharer = "', tostring(Sharers[0]), '";'), ''))
+| project-rename SharePointTenant = SpTenant
+| order by Severity asc, Recipients desc

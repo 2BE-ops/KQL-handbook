@@ -1,0 +1,50 @@
+// =====================================================================
+// Last known user of a device — by DeviceName
+// Resolves the name to the most recent DeviceId first (renames/re-images
+// can leave several IDs per name), then unions logon, process and network
+// telemetry. One row per (device, user) with first/last seen and sources.
+// =====================================================================
+let targetDeviceName = "";        // ← target device name
+let deviceId =
+    toscalar(
+        DeviceInfo
+        | where DeviceName =~ targetDeviceName
+        | summarize arg_max(Timestamp, DeviceId) by DeviceName
+        | project DeviceId
+    );
+union
+(
+    // True logons (if available)
+    DeviceLogonEvents
+    | where Timestamp > ago(30d)
+    | where DeviceId == deviceId
+    | extend UserName = strcat(AccountDomain, "\\", AccountName)
+    | project Timestamp, DeviceId, DeviceName, UserName, Source = "DeviceLogonEvents"
+),
+(
+    // Process executions – who was running what
+    DeviceProcessEvents
+    | where Timestamp > ago(30d)
+    | where DeviceId == deviceId
+    | extend UserName = strcat(AccountDomain, "\\", AccountName)
+    | project Timestamp, DeviceId, DeviceName, UserName, Source = "DeviceProcessEvents"
+),
+(
+    // Network activity – user from initiating process account
+    DeviceNetworkEvents
+    | where Timestamp > ago(30d)
+    | where DeviceId == deviceId
+    | extend UserName = strcat(
+        tostring(InitiatingProcessAccountDomain),
+        "\\",
+        tostring(InitiatingProcessAccountName)
+    )
+    | where isnotempty(InitiatingProcessAccountName)
+    | project Timestamp, DeviceId, DeviceName, UserName, Source = "DeviceNetworkEvents"
+)
+| summarize
+    FirstSeen = min(Timestamp),
+    LastSeen  = max(Timestamp),
+    Sources   = make_set(Source)
+    by DeviceId, DeviceName, UserName
+| top 20 by LastSeen desc

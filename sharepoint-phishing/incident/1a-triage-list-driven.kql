@@ -1,0 +1,159 @@
+// ============================================================================
+// incident/1A — TRIAGE (list-driven): Which campaign is active right now?
+// FLOW     : detection/0a or 0b alert already names the tenant ─▶ skip to 2.
+//            No alert (user report / suspicion) ─▶ THIS (mature lists;
+//            confusing picture ─▶ 1B) ──copy PasteKeys──▶ 2-deep-dive
+// ----------------------------------------------------------------------------
+// Question : Right now, is anything known-malicious or unvetted active?
+//            One row per tenant worth looking at: malicious (act), unknown
+//            (triage), trusted only on single-sharer fan-out (possible
+//            compromised partner).
+// Speed    : No runtime baselines — trust was decided ahead of time by the
+//            lists in 00-shared-lists (built by the detection track). Short
+//            window + static lists = runs in seconds, re-run as often as
+//            you like.
+// Reading  : Malicious rows are P0/P1 — go straight to 2 (paste PasteKeys).
+//            Unknown rows rank by clicks, single-sharer fan-out,
+//            org-impersonation subjects and phish shape; feed quiet unknowns
+//            to detection/1 for classification instead of chasing them here.
+//            Trusted rows appear ONLY when one sharer fans out to >=
+//            trustedSharerFanoutAlert recipients — one compromised user
+//            inside a legit partner; take TopSharer to 2 as targetSharer.
+//            IsLookalike/LookalikeSimilarity are CONTEXT columns only —
+//            attackers rarely bother crafting lookalike tenants, so it gets
+//            no priority tier; glance at it, don't chase it. The subject
+//            impersonation signal is the more realistic one, and even that
+//            is generic — treat it as supporting evidence, not proof.
+// Surface  : Advanced Hunting, manual
+// Tables   : EmailUrlInfo, EmailEvents, UrlClickEvents
+// Embeds   : ownTenants, trustedTenants, maliciousTenants, phishSubjectTerms
+// ============================================================================
+let lookback = 1d;                        // short triage window; 7d for a wider look
+let sharerFanoutAlert = 10;               // unknown-tenant single-sharer fan-out worth escalating
+let trustedSharerFanoutAlert = 25;        // higher bar before a TRUSTED tenant surfaces
+let lookalikeThreshold = 0.85;            // codepoint-set similarity vs our tenant name (context column only)
+let ownTenants = dynamic(["contoso"]);
+let ownTenantString = "contoso";
+let ownOrgNameTokens = dynamic(["contoso corporation", "contoso corp"]);
+// ---- Classification lists — sync from 00-shared-lists.kql -------------------
+let trustedTenants = dynamic([
+    "fabrikam", "adventureworks", "wingtiptoys"
+]);
+let maliciousTenants = dynamic([]);
+let phishSubjectTerms = dynamic([
+    "shared", "sent you", "document", "invoice", "view file", "review",
+    "secure", "signed", "esign", "docusign", "action required", "fax",
+    "contract", "payment", "remittance", "purchase order", "rfq"
+]);
+let tenantPattern = @"https?://([a-z0-9-]+?)(?:-my)?\.sharepoint\.com";
+//
+// Inbound mail with external SP links: row per (msg, tenant, recipient).
+// Trusted tenants stay IN scope here so a compromised sharer inside a
+// trusted partner can surface — they are dropped at the end unless their
+// single-sharer fan-out crosses trustedSharerFanoutAlert.
+let spMail = materialize(
+    EmailUrlInfo
+    | where Timestamp > ago(lookback)
+    | where Url has "sharepoint.com"
+    | extend SharePointTenant = extract(tenantPattern, 1, tolower(Url))
+    | where isnotempty(SharePointTenant) and SharePointTenant !in (ownTenants)
+    | extend Sharer = extract(@"/personal/([^/]+)/", 1, tolower(Url))
+    | summarize SampleUrl = take_any(Url), Sharer = take_any(Sharer)
+              by NetworkMessageId, SharePointTenant
+    | join kind=inner (
+        EmailEvents
+        | where Timestamp > ago(lookback)
+        | where EmailDirection == "Inbound"
+    ) on NetworkMessageId
+);
+//
+// Single-sharer fan-out per tenant (which sharer, how wide)
+let sharerFanout = spMail
+    | where isnotempty(Sharer)
+    | summarize FanOut = dcount(RecipientEmailAddress) by SharePointTenant, Sharer
+    | summarize arg_max(FanOut, Sharer) by SharePointTenant
+    | project SharePointTenant, TopSharerRecipients = FanOut, TopSharer = Sharer;
+//
+let clicks = UrlClickEvents
+    | where Timestamp > ago(lookback)
+    | where Url has "sharepoint.com"
+    | extend SharePointTenant = extract(tenantPattern, 1, tolower(Url))
+    | where isnotempty(SharePointTenant) and SharePointTenant !in (ownTenants)
+    | summarize
+        TotalClicks    = count(),
+        UniqueClickers = dcount(AccountUpn),
+        AllowedClicks  = countif(ActionType == "ClickAllowed"),
+        BlockedClicks  = countif(ActionType == "ClickBlocked")
+        by SharePointTenant;
+//
+spMail
+| summarize
+    EmailCount        = dcount(NetworkMessageId),
+    Recipients        = dcount(RecipientEmailAddress),
+    UniqueSenders     = dcount(SenderFromAddress),
+    UniqueSharers     = dcount(Sharer),
+    DeliveredCount    = dcountif(NetworkMessageId, DeliveryAction == "Delivered"),
+    JunkedCount       = dcountif(NetworkMessageId, DeliveryAction == "Junked"),
+    BlockedAtDelivery = dcountif(NetworkMessageId, DeliveryAction in ("Blocked", "Replaced")),
+    PhishShapedMsgs   = dcountif(NetworkMessageId, Subject has_any (phishSubjectTerms)),
+    ImpersonationMsgs = dcountif(NetworkMessageId, Subject has_any (ownOrgNameTokens)
+                            or tolower(Subject) contains ownTenantString),
+    SampleSubjects    = make_set(Subject, 10),
+    SampleSenders     = make_set(SenderFromAddress, 10),
+    SampleUrl         = take_any(SampleUrl),
+    FirstSeen         = min(Timestamp),
+    LastSeen          = max(Timestamp)
+    by SharePointTenant
+| join kind=leftouter sharerFanout on SharePointTenant
+| join kind=leftouter clicks on SharePointTenant
+| extend
+    TotalClicks         = coalesce(TotalClicks, 0),
+    UniqueClickers      = coalesce(UniqueClickers, 0),
+    AllowedClicks       = coalesce(AllowedClicks, 0),
+    BlockedClicks       = coalesce(BlockedClicks, 0),
+    TopSharerRecipients = coalesce(TopSharerRecipients, 0)
+| extend Classification = case(
+    SharePointTenant in (maliciousTenants), "Malicious",
+    SharePointTenant in (trustedTenants),   "Trusted (listed)",
+                                            "Unknown")
+| where Classification != "Trusted (listed)"
+     or TopSharerRecipients >= trustedSharerFanoutAlert
+// Lookalike check — SECONDARY context only, no priority tier (attackers
+// rarely craft lookalike tenants; cheap here: one row per tenant by now)
+| extend OwnChars    = unicode_codepoints_from_string(ownTenantString),
+         TenantChars = unicode_codepoints_from_string(SharePointTenant)
+| extend LookalikeSimilarity = iif(array_length(set_union(OwnChars, TenantChars)) == 0, 0.0,
+    toreal(array_length(set_intersect(OwnChars, TenantChars))) /
+    toreal(array_length(set_union(OwnChars, TenantChars))))
+| extend IsLookalike = Classification == "Unknown"
+    and LookalikeSimilarity >= lookalikeThreshold
+| extend Priority = case(
+    Classification == "Malicious" and AllowedClicks > 0,
+        "P0 - KNOWN-MALICIOUS tenant, users reached the lure",
+    Classification == "Malicious",
+        "P1 - KNOWN-MALICIOUS tenant active",
+    Classification == "Trusted (listed)",
+        "P2 - TRUSTED tenant, single-sharer fan-out - possible compromised partner (2 with TopSharer)",
+    AllowedClicks > 0,
+        "P1 - Unknown tenant, users reached the lure",
+    BlockedClicks > 0,
+        "P2 - Unknown tenant, clicks attempted (blocked)",
+    TopSharerRecipients >= sharerFanoutAlert,
+        "P2 - Unknown tenant, single-sharer fan-out (take TopSharer to 2)",
+    ImpersonationMsgs > 0,
+        "P2 - Unknown tenant, subjects impersonate our org",
+    PhishShapedMsgs > 0 and DeliveredCount >= 5,
+        "P2 - Unknown tenant, phish-shaped burst",
+    DeliveredCount >= 1,
+        "P3 - Unknown tenant, delivered - classify via detection/1",
+        "P4 - Blocked/junked only")
+// Ready-to-paste keys for 2/3/4 — copy the whole cell
+| extend PasteKeys = strcat('let targetTenant = "', SharePointTenant, '";',
+    iff(isnotempty(TopSharer), strcat(' let targetSharer = "', TopSharer, '";'), ''))
+| project Priority, PasteKeys, Classification, SharePointTenant, TopSharer, TopSharerRecipients,
+    EmailCount, Recipients, DeliveredCount, JunkedCount, BlockedAtDelivery,
+    AllowedClicks, BlockedClicks, UniqueClickers,
+    UniqueSenders, UniqueSharers, PhishShapedMsgs, ImpersonationMsgs,
+    IsLookalike, LookalikeSimilarity,
+    SampleSubjects, SampleSenders, SampleUrl, FirstSeen, LastSeen
+| order by Priority asc, AllowedClicks desc, TopSharerRecipients desc, DeliveredCount desc

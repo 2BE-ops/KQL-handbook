@@ -1,0 +1,57 @@
+// ============================================================================
+// detection/0A — Malicious-tenant tripwire rule (Continuous/NRT-eligible)
+// ----------------------------------------------------------------------------
+// STATUS  : Written and staged — NOT DEPLOYED. See detection/README.md.
+// Surface : Defender XDR Advanced Hunting — Custom Detection Rule query
+// Cadence : Continuous (NRT). NRT rules accept SINGLE-TABLE queries only —
+//           no join / union / summarize; where/extend/project-family
+//           operators. This file obeys that: EmailUrlInfo alone, row-shaped
+//           operators only. It also runs unchanged manually or on a timed
+//           cadence.
+// Table   : EmailUrlInfo (only)
+// Role    : The alarm the whole detection track exists to feed: ANY mail URL
+//           pointing at a maliciousTenants entry alerts as the record
+//           arrives — delivery time, before anyone clicks. Fast and cheap
+//           because trust was decided ahead of time by the list program
+//           (1 → 2 → 3 → 00-shared-lists → here).
+// Traded for NRT (and where each piece lives instead):
+//           - unknown-tenant click/burst gates → detection/0b (hourly
+//             behavioural rule), incident/1a/1b (manual triage) and
+//             detection/1 (weekly review queue) — NRT cannot join
+//             EmailEvents/UrlClickEvents
+//           - Recipient/Subject columns → not in EmailUrlInfo, so this rule
+//             ALERTS but takes no email actions; containment is incident/2
+//             with the tenant key, which is the standing workflow anyway.
+// Caveats : 1. If rule creation rejects the query for lacking an
+//              impacted-asset column (EmailUrlInfo has none of the
+//              account/device/recipient columns), use the UrlClickEvents
+//              variant in detection/README.md — same tripwire, has
+//              AccountUpn, but fires on click instead of delivery.
+//           2. If the editor rejects the `let` statement, inline the list:
+//              | where SpTenant in ("badtenant1", "badtenant2")
+// MIRROR  : maliciousTenants must stay in sync with 00-shared-lists.kql and
+//           its other consumers (detection/0b, incident/1a, incident/1b,
+//           detection/1, detection/3).
+// ============================================================================
+let lookback = 1h;   // manual-run window; effectively ignored under NRT streaming
+let maliciousTenants = dynamic([
+    // sync from 00-shared-lists.kql — empty list = rule produces nothing
+]);
+EmailUrlInfo
+| where Timestamp > ago(lookback)
+| where UrlDomain endswith ".sharepoint.com"
+| extend SpTenant = extract(@"^([a-z0-9-]+?)(?:-my)?\.sharepoint\.com$", 1, tolower(UrlDomain))
+| where isnotempty(SpTenant)
+| where SpTenant in (maliciousTenants)
+| extend Classification = "Malicious",
+         Severity       = "P1-High"
+| project
+    Timestamp,
+    ReportId,
+    NetworkMessageId,
+    Url,
+    UrlDomain,
+    UrlLocation,
+    SpTenant,
+    Classification,
+    Severity

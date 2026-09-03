@@ -1,0 +1,140 @@
+// ============================================================================
+// incident/3B — VERIFY EVICTION: Did we actually get the attacker out?
+// FLOW     : 4 (P0/P1 rows) ─▶ reset password + revoke sessions + remove
+//            persistence ─▶ THIS. Re-run until every account reads "OK".
+// ----------------------------------------------------------------------------
+// Twin of 3a. 3a verifies the MAIL was purged; 3b verifies the ACCOUNT was
+// evicted. A campaign is not closed until both read clean — purging every
+// copy of a lure from an account the attacker still holds achieves nothing.
+//
+// Question : After the eviction actions, for each suspect account: did anything
+//            sign in successfully afterwards, are the inbox rules / forwarding
+//            actually gone, were auth methods re-registered, do OAuth consents
+//            or registered devices remain, did the account send more mail?
+// Surface  : Advanced Hunting, manual, after every eviction.
+// Tables   : EntraIdSignInEvents, CloudAppEvents, EmailEvents, IdentityInfo
+// Inputs   : suspectUpns  — PasteUpn cells from 4 (and from 6).
+//            evictionTime — when you revoked sessions / reset the password.
+//                           EVERYTHING after this timestamp is the finding.
+// Reading  : SignInsAfterEviction is the headline. Successful interactive
+//            sign-ins after eviction from a NEW IP mean the reset did not
+//            take, or a second persistence path is still open (check the
+//            consent and auth-method columns before resetting again — a
+//            password reset does not revoke an OAuth grant, and does not
+//            remove an attacker-registered MFA method).
+// Caveats  : Entra revocation is not instant for all token types; allow a few
+//            minutes of tail. Access tokens already issued can survive up to
+//            their lifetime, so sign-in silence is necessary, not sufficient.
+//            Action vocabulary pending probe P7 — same silent-fail risk as 4.
+// Next     : all OK ─▶ close, after 3a also reads fully remediated.
+//            not OK ─▶ evict again, then 6 to re-sweep for missed victims.
+// ============================================================================
+let lookback     = 7d;
+let evictionTime = datetime(2026-01-01 00:00:00);   // ← REQUIRED: when you revoked
+let suspectUpns  = dynamic([
+    // "user@contoso.com",   ← paste 4's PasteUpn cells
+]);
+//
+// Resolve UPN <-> primary SMTP so the mail leg cannot miss (probe P8).
+let idMap = materialize(
+    IdentityInfo
+    | where isnotempty(AccountUpn)
+    | extend AccountUpn = tolower(AccountUpn)
+    | summarize arg_max(Timestamp, EmailAddress, AccountObjectId) by AccountUpn
+    | project AccountUpn, PrimarySmtp = tolower(EmailAddress), AccountObjectId
+);
+let suspects = materialize(
+    print AccountUpn = suspectUpns
+    | mv-expand AccountUpn to typeof(string)
+    | extend AccountUpn = tolower(AccountUpn)
+    | where isnotempty(AccountUpn)
+    | join kind=leftouter idMap on AccountUpn
+    | extend PrimarySmtp = coalesce(PrimarySmtp, AccountUpn)
+    | project AccountUpn, PrimarySmtp, AccountObjectId
+);
+let suspectList  = suspects | distinct AccountUpn;
+let addrToUpn    = materialize(
+    suspects
+    | mv-expand Addr = pack_array(AccountUpn, PrimarySmtp) to typeof(string)
+    | where isnotempty(Addr)
+    | distinct Addr, AccountUpn
+);
+let suspectAddrs = addrToUpn | distinct Addr;
+//
+// ---- Sign-ins after eviction ----------------------------------------------------
+let signIns =
+    EntraIdSignInEvents
+    | where Timestamp > ago(lookback) and Timestamp > evictionTime
+    | extend AccountUpn = tolower(AccountUpn)
+    | where AccountUpn in (suspectList)
+    | where ErrorCode == 0
+    | summarize SignInsAfterEviction = count(),
+                SignInIPsAfter       = make_set(IPAddress, 20),
+                DistinctIPsAfter     = dcount(IPAddress),
+                AppsAfter            = make_set(Application, 10),
+                MaxRiskAfter         = max(RiskLevelDuringSignIn),
+                LastSignIn           = max(Timestamp)
+              by AccountUpn;
+//
+// ---- Persistence that survived (or was re-created) after eviction ---------------
+let persistence =
+    CloudAppEvents
+    | where Timestamp > ago(lookback) and Timestamp > evictionTime
+    | where ActionType has_any ("New-InboxRule", "Set-InboxRule", "UpdateInboxRules",
+                                "Set-Mailbox", "Add-MailboxPermission",
+                                "Add-RecipientPermission",
+                                "User registered security info",
+                                "User changed default security info",
+                                "Consent to application", "Add OAuth2PermissionGrant",
+                                "Add delegated permission grant",
+                                "Add app role assignment grant to user",
+                                "Add service principal", "Add service principal credentials",
+                                "Register device", "Add device")
+    | extend Addr = tolower(coalesce(tostring(RawEventData.UserId), AccountId))
+    | where Addr in (suspectAddrs)
+    | join kind=inner addrToUpn on Addr
+    | summarize PersistOpsAfter     = count(),
+                PersistActionsAfter = make_set(ActionType, 15),
+                LastPersistOp       = max(Timestamp)
+              by AccountUpn;
+//
+// ---- Mail sent after eviction ---------------------------------------------------
+let sentAfter =
+    EmailEvents
+    | where Timestamp > ago(lookback) and Timestamp > evictionTime
+    | where EmailDirection in ("Intra-org", "Outbound")
+    | extend Addr = tolower(SenderFromAddress)
+    | where Addr in (suspectAddrs)
+    | join kind=inner addrToUpn on Addr
+    | summarize SentAfterEviction   = dcount(NetworkMessageId),
+                RecipientsAfter     = dcount(tolower(RecipientEmailAddress)),
+                SubjectsAfter       = make_set(Subject, 10),
+                LastSendAfter       = max(Timestamp)
+              by AccountUpn;
+//
+// ---- One row per suspect ---------------------------------------------------------
+suspects
+| join kind=leftouter signIns     on AccountUpn
+| join kind=leftouter persistence on AccountUpn
+| join kind=leftouter sentAfter   on AccountUpn
+| extend SignInsAfterEviction = coalesce(SignInsAfterEviction, 0),
+         PersistOpsAfter      = coalesce(PersistOpsAfter, 0),
+         SentAfterEviction    = coalesce(SentAfterEviction, 0),
+         RecipientsAfter      = coalesce(RecipientsAfter, 0)
+| extend EvictionStatus = case(
+    PersistOpsAfter > 0,
+        strcat("ALERT - ", PersistOpsAfter, " persistence op(s) AFTER eviction - attacker still has the account"),
+    RecipientsAfter >= 20,
+        strcat("ALERT - mailed ", RecipientsAfter, " recipients after eviction"),
+    DistinctIPsAfter > 1 and MaxRiskAfter >= 50,
+        "ALERT - risky sign-ins from multiple IPs after eviction",
+    SignInsAfterEviction > 0 and MaxRiskAfter >= 50,
+        "WARN - risky sign-in after eviction - confirm the IP is the user",
+    SignInsAfterEviction > 0,
+        "CHECK - sign-ins after eviction (expected if the user is back on the account) - verify the IPs",
+    "OK - no sign-in, no persistence, no mail since eviction")
+| project EvictionStatus, AccountUpn, AccountObjectId,
+    SignInsAfterEviction, DistinctIPsAfter, SignInIPsAfter, MaxRiskAfter, AppsAfter, LastSignIn,
+    PersistOpsAfter, PersistActionsAfter, LastPersistOp,
+    SentAfterEviction, RecipientsAfter, SubjectsAfter, LastSendAfter
+| order by EvictionStatus asc

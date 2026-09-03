@@ -1,0 +1,165 @@
+//══════════════════════════════════════════════════════════════════════
+// AI coding agents — autonomous execution hunt, risk-tiered
+// Finds agent CLIs running with approval bypasses, auto-accept modes,
+// or headless/unattended, and flags elevation (admin / root / SYSTEM).
+//
+//  Tier         Meaning                                      Trigger
+//  T0-Critical  bypass-all approvals + elevated              bypass flag AND admin/root/SYSTEM
+//  T1-High      bypass-all as standard user, OR              bypass flag
+//               auto-accept while elevated                   auto-accept AND elevated
+//  T2-Medium    auto-accept edits/commands, OR headless      auto-accept, or headless AND
+//               launched elevated / by scheduler-service     (elevated or automation parent)
+//  T3-Low       headless/non-interactive, default approvals  headless only
+//  T4-Info      interactive agent use (inventory baseline)   everything else
+//
+// RiskScore (sorting within tier):
+//   +40 bypass-all   +20 auto-accept   +10 headless
+//   +25 elevated     +10 automation parent (cron/systemd/svchost/CI)
+//══════════════════════════════════════════════════════════════════════
+let Lookback = 30d;
+// ── Tier A: distinctive binary names ──────────────────────────────────
+let AgentBinaries_Distinctive = dynamic([
+    "claude.exe","claude","claude-code",
+    "codex.exe","codex",
+    "cursor.exe","cursor","cursor-agent",
+    "windsurf.exe","windsurf",
+    "aider.exe","aider",
+    "gemini-cli","geminicli",
+    "openhands","opendevin",
+    "auggie","auggie.exe",
+    "plandex","plandex.exe",
+    "opencode","opencode.exe",
+    "trae.exe","trae",
+    "gpt-engineer","gptengineer",
+    "open-interpreter","interpreter",
+    "swe-agent","sweagent",
+    "ra-aid","raaid",
+    "kilocode","kilo-code",
+    "devika","mentat","codebuff",
+    "tabnine.exe","refact","qodo",
+    "warp.exe","warp-terminal",
+    "zed.exe","zed",
+    "pearai.exe","void.exe","melty.exe",
+    "junie","copilot.exe","github-copilot-cli"]);
+// ── Tier B: generic names — need corroborating path/args ──────────────
+let AgentBinaries_Generic = dynamic([
+    "amp","amp.exe","goose","goose.exe","crush","crush.exe",
+    "droid","droid.exe","cody","cody.exe","q","q.exe",
+    "gemini","gemini.exe","pdx","pdx.exe","cn","cn.exe"]);
+let AgentPathHints = dynamic([
+    "sourcegraph","block\\goose",".goose","factory","droid",
+    "aws\\amazonq","amazon-q","amazonq",
+    "google\\gemini",".gemini","plandex","continue",".cody"]);
+// ── Gate 3: npm/pip-shim launches. Node-based agents (Claude Code,
+//    Copilot CLI, Gemini CLI…) frequently surface as node.exe running
+//    cli.js — binary-name gating alone misses these entirely. ─────────
+let AgentRuntimes = dynamic(["node.exe","node","bun.exe","bun","deno.exe","deno"]);
+let AgentRuntimeMarkers = dynamic([
+    "anthropic","claude","aider","codex","copilot","gemini",
+    "goose","openhands","plandex","opencode","cline"]);
+// ── Parents implying unattended execution ─────────────────────────────
+let AutomationParents = dynamic([
+    "services.exe","svchost.exe","taskeng.exe","taskhostw.exe","wmiprvse.exe",
+    "cron","crond","anacron","atd","systemd","launchd","sshd",
+    "runner.worker","runner.listener","agent.worker","jenkins"]);
+// ── Autonomy fingerprints. CL is lowercased; the regexes double as
+//    detection AND evidence extraction (matched flags land in output).
+//
+// BYPASS-ALL — no approval gate on shell/file actions:
+//   Claude Code   --dangerously-skip-permissions | --permission-mode bypassPermissions
+//   Codex CLI     --dangerously-bypass-approvals-and-sandbox | --yolo
+//                 | --ask-for-approval never | -a never | --sandbox danger-full-access
+//   Gemini CLI    --yolo | -y | --approval-mode yolo
+//   Amazon Q      --trust-all-tools
+//   Copilot CLI   --allow-all-tools
+//   Amp           --dangerously-allow-all
+//   RA.Aid        --cowboy-mode
+//   Open Interp.  --auto_run | -y
+//   Goose         GOOSE_MODE=auto (only visible if passed inline on cmdline)
+//   (--dangerously-[a-z-]+ is a deliberate catch-all for the whole family)
+let rxBypassAll = @"(--dangerously-[a-z\-]+|--yolo\b|--trust-all-tools\b|--allow-all-tools\b|--cowboy-mode\b|--auto[_\-]run\b|--auto-approve\b|--skip-permissions\b|--no-confirm\b|permission-mode[= ]+bypasspermissions|approval-mode[= ]+yolo|ask-for-approval[= ]+never|(?:^|\s)-a[= ]+never\b|sandbox[= ]+danger-full-access|goose_mode=auto)";
+// AUTO-ACCEPT — approvals auto-granted but some sandbox/scoping remains:
+//   Codex/Plandex --full-auto        Claude Code --permission-mode acceptEdits
+//   Aider         --yes-always|--yes Gemini CLI  --approval-mode auto_edit
+//   droid exec    --auto high|medium Copilot CLI --allow-tool
+//   Amazon Q      --trust-tools      cursor-agent -f/--force (boolean below)
+let rxAutoAccept = @"(--full-auto\b|permission-mode[= ]+acceptedits|--yes-always\b|--yes\b|approval-mode[= ]+auto_edit|--auto[= ]+(?:high|medium)\b|--allow-tool\b|--trust-tools\b)";
+// HEADLESS — non-interactive / pipeline execution (no human at the wheel):
+let rxHeadless = @"(--print\b|(?:^|\s)-p\b|--non-interactive\b|--no-interactive\b|--headless\b|--output-format[= ]+\S+|codex\s+exec\b)";
+DeviceProcessEvents
+| where Timestamp > ago(Lookback)
+| extend FN = tolower(FileName), FP = tolower(FolderPath), CL = tolower(ProcessCommandLine)
+// ── Gate: distinctive binary, corroborated generic, or runtime shim ──
+| where FN in (AgentBinaries_Distinctive)
+     or (FN in (AgentBinaries_Generic)
+         and (FP has_any (AgentPathHints)
+              or CL has_any ("--model","--prompt","chat","agent","mcp")))
+     or (FN in (AgentRuntimes) and CL has_any (AgentRuntimeMarkers))
+// ── Signal extraction ─────────────────────────────────────────────────
+| extend BypassFlags   = extract_all(rxBypassAll, CL),
+         AutoFlags     = extract_all(rxAutoAccept, CL),
+         HeadlessFlags = extract_all(rxHeadless, CL)
+| extend HasBypassAll = coalesce(array_length(BypassFlags), 0) > 0
+              // short-flag yolo, scoped per-binary to avoid collisions:
+              or ((FN startswith "gemini" or FN has "interpreter")
+                  and CL matches regex @"(^|\s)-y(\s|$)"),
+         HasAutoAccept = coalesce(array_length(AutoFlags), 0) > 0
+              or (FN startswith "cursor" and CL matches regex @"(^|\s)-f(orce)?(\s|$)"),
+         IsHeadless = coalesce(array_length(HeadlessFlags), 0) > 0,
+         // Elevation: Windows integrity/token, plus root & SYSTEM for
+         // macOS/Linux MDE where IntegrityLevel is blank
+         IsElevated = ProcessIntegrityLevel in~ ("High","System")
+              or ProcessTokenElevation == "TokenElevationTypeFull"
+              or AccountName in~ ("root","system")
+              or AccountSid == "S-1-5-18",
+         FromAutomation = InitiatingProcessFileName in~ (AutomationParents)
+// ── Scoring + tiering ────────────────────────────────────────────────
+| extend RiskScore = 40*toint(HasBypassAll) + 20*toint(HasAutoAccept)
+              + 10*toint(IsHeadless) + 25*toint(IsElevated) + 10*toint(FromAutomation),
+         RiskTier = case(
+              HasBypassAll and IsElevated,               "T0-Critical",
+              HasBypassAll,                              "T1-High",
+              HasAutoAccept and IsElevated,              "T1-High",
+              HasAutoAccept,                             "T2-Medium",
+              IsHeadless and (IsElevated or FromAutomation), "T2-Medium",
+              IsHeadless,                                "T3-Low",
+              "T4-Info"),
+         FlagEvidence = strcat_array(array_concat(
+              coalesce(BypassFlags, dynamic([])),
+              coalesce(AutoFlags, dynamic([])),
+              coalesce(HeadlessFlags, dynamic([]))), " ")
+// Uncomment to hunt only actionable tiers:
+// | where RiskTier !in ("T3-Low", "T4-Info")
+| summarize Runs = count(),
+            ElevatedRuns = countif(IsElevated),
+            UnattendedRuns = countif(FromAutomation),
+            MaxRiskScore = max(RiskScore),
+            FirstSeen = min(Timestamp), LastSeen = max(Timestamp),
+            Users = make_set(AccountName, 10),
+            ElevatedUsers = make_set_if(AccountName, IsElevated, 10),
+            FlagsSeen = make_set_if(FlagEvidence, isnotempty(FlagEvidence), 15),
+            Paths = make_set(FolderPath, 5),
+            SpawnedBy = make_set(InitiatingProcessFileName, 5),
+            SampleCmds = make_set(ProcessCommandLine, 3)
+    by RiskTier, AgentBinary = FileName, DeviceName
+| extend TierRank = toint(substring(RiskTier, 1, 1))
+| sort by TierRank asc, MaxRiskScore desc, Runs desc
+| project-away TierRank
+//
+//══════════════════════════════════════════════════════════════════════
+// COMPANION (optional): bypass "set" in config files never hits the
+// command line — Claude Code settings.json defaultMode:bypassPermissions,
+// Codex config.toml approval_policy="never", Aider yes-always:true,
+// Goose GOOSE_MODE:auto, Cursor IDE yolo, Cline auto-approve.
+// MDE can't read file contents, so this only flags CHANGES to those
+// configs. Pair with an endpoint compliance script for ground truth.
+//══════════════════════════════════════════════════════════════════════
+// DeviceFileEvents
+// | where Timestamp > ago(30d)
+// | where FileName in~ ("settings.json","settings.local.json",
+//                       "config.toml","config.yaml",".aider.conf.yml")
+// | where FolderPath has_any (".claude",".codex",".gemini",".goose",".aider")
+// | project Timestamp, DeviceName, ActionType, FolderPath, FileName,
+//           InitiatingProcessAccountName, InitiatingProcessFileName,
+//           InitiatingProcessCommandLine
+// | sort by Timestamp desc

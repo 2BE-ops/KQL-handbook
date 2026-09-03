@@ -1,0 +1,401 @@
+// ============================================================================
+// incident/4 — CHECK COMPROMISE: Did this campaign's clickers get owned?
+// FLOW     : 2 / 3a (same keys) ─▶ THIS ─▶ 7 · 6 · 5 · 3b
+// ----------------------------------------------------------------------------
+// Question : For users who clicked THIS campaign's lure: risky sign-ins,
+//            session anomalies, MFA/auth-method registration, OAuth consent
+//            grants, device registration, mailbox rule/forwarding changes,
+//            mass mail sending (internal phish of ANY type, not just SP
+//            re-shares), or SharePoint sharing bursts afterwards?
+// Surface  : Advanced Hunting, manual — for every campaign with allowed
+//            clicks. One row per clicker.
+// Tables   : UrlClickEvents, EmailEvents, EntraIdSignInEvents, CloudAppEvents,
+//            IdentityInfo
+// Identity : clicks are keyed by AccountUpn, sent mail by SMTP address, and
+//            CloudAppEvents by whatever the audit record carried. Where UPN
+//            != primary SMTP the mass-mail leg silently returns nothing and
+//            P0 verdicts never fire. Every leg now resolves through addrToUpn
+//            (IdentityInfo) — pending probe P8.
+// Windows  : TWO. postClickWindow (24h) for burst behaviour, which is
+//            immediate; persistWindow (72h) for identity persistence, which
+//            is not — AiTM operators sit on stolen cookies for days, and
+//            Entra raises aggregated risk retroactively. Aggregated risk is
+//            additionally checked UNGATED by any window, because a risk
+//            verdict that lands three days later is still about this click.
+// Inputs   : CAMPAIGN KEYS — the analyst has already confirmed these
+//            malicious; the query assumes that and does NOT re-verify.
+//            Set at least one (no keys ⇒ empty result, never a tenant sweep):
+//              targetTenant  — SP tenant slug (SharePoint-lure campaigns)
+//              targetSender  — confirmed sender address (any phish shape)
+//              targetSubject — confirmed subject fragment (any phish shape)
+//            targetSharer (optional) — with targetTenant on a compromised
+//            legit tenant: scopes to clicks on that sharer's lure only, so
+//            legitimate clickers of the tenant's normal mail stay out.
+// Output   : AccountObjectId is included so user-level Take actions work
+//            directly on these rows (require sign-in again / mark user
+//            compromised — via Entra ID P2 licensing).
+// Prereqs  : EntraIdSignInEvents (Entra ID P2); CloudAppEvents (MDA + O365
+//            connector, confirmed). Country column + SessionId /
+//            RiskLevelAggregated pending probe P1/P6; CloudAppEvents
+//            AccountId-as-UPN pending probe P4; mailbox-op action vocabulary
+//            pending probe P5; Entra audit vocabulary for auth-method /
+//            consent / device legs pending probe P7 (_probes.kql). Those
+//            three legs are the LEAST verified in this file — if P7 comes
+//            back with different ActionType strings, they return empty and
+//            fail silent. Confirm P7 before trusting a clean result.
+// Next     : P0/P1 rows ─▶ 7 (what did the click actually lead to)
+//                       ─▶ 6 (sweep the attacker's IPs for victims we missed)
+//                       ─▶ 5 (internal spread) ─▶ 3b (did eviction hold)
+// ============================================================================
+let lookback        = 7d;                 // up to 30d for older campaigns
+let postClickWindow = 24h;                // burst behaviour: mail / sharing
+let persistWindow   = 72h;                // identity persistence: sign-ins, MFA, consent, device
+let mailBurstAlert  = 20;                 // ← adjustable: distinct recipients mailed post-click ⇒ mass-mailing
+let shareBurstAlert = 10;                 // post-click share targets ⇒ actively spreading
+let targetTenant    = "";                 // ← key: SP tenant slug (canonical, no -my)
+let targetSharer    = "";                 // ← optional /personal/ refinement of targetTenant
+let targetSender    = "";                 // ← key: confirmed-malicious sender address
+let targetSubject   = "";                 // ← key: confirmed-malicious subject fragment
+let ownEmailDomains = dynamic(["contoso.com", "contoso.org"]);
+let tenantPattern   = @"https?://([a-z0-9-]+?)(?:-my)?\.sharepoint\.com";
+let keysSet         = isnotempty(targetTenant) or isnotempty(targetSender) or isnotempty(targetSubject);
+//
+// ---- Users who clicked THIS campaign's lure (any phish shape) -------------------
+let clicks = materialize(
+    UrlClickEvents
+    | where Timestamp > ago(lookback)
+    | where keysSet
+    | where Workload == "Email"
+    | where ActionType == "ClickAllowed" or IsClickedThrough == true
+    | extend SharePointTenant = extract(tenantPattern, 1, tolower(Url))
+    | where isempty(targetTenant) or SharePointTenant =~ targetTenant
+    | where isempty(targetSharer) or Url contains targetSharer
+    | extend AccountUpn = tolower(AccountUpn)
+    | join kind=leftouter (
+        EmailEvents
+        | where Timestamp > ago(lookback)
+        | where isnotempty(NetworkMessageId)
+        | distinct NetworkMessageId, Subject, SenderFromAddress
+      ) on NetworkMessageId
+    | where isempty(targetSender)  or SenderFromAddress =~ targetSender
+    | where isempty(targetSubject) or Subject contains targetSubject
+    | project ClickTime = Timestamp, AccountUpn, ClickIP = IPAddress,
+              Url, NetworkMessageId, Subject, SenderFromAddress
+);
+//
+// ---- Identity resolution (probe P8) ---------------------------------------------
+// Every downstream leg keys on a different identifier. Resolve them all to the
+// clicker's canonical AccountUpn instead of assuming UPN == SMTP == AccountId.
+let idMap = materialize(
+    IdentityInfo
+    | where isnotempty(AccountUpn)
+    | extend AccountUpn = tolower(AccountUpn)
+    | summarize arg_max(Timestamp, EmailAddress, AccountObjectId, Department, JobTitle)
+              by AccountUpn
+    | project AccountUpn, PrimarySmtp = tolower(EmailAddress),
+              AccountObjectId, Department, JobTitle
+);
+let clickerIds = materialize(
+    clicks
+    | distinct AccountUpn
+    | join kind=leftouter idMap on AccountUpn
+    | extend PrimarySmtp = coalesce(PrimarySmtp, AccountUpn)
+    | project AccountUpn, PrimarySmtp, AccountObjectId, Department, JobTitle
+);
+let clickers = clickerIds | distinct AccountUpn;
+// Address -> canonical UPN, covering both spellings.
+let addrToUpn = materialize(
+    clickerIds
+    | mv-expand Addr = pack_array(AccountUpn, PrimarySmtp) to typeof(string)
+    | where isnotempty(Addr)
+    | distinct Addr, AccountUpn
+);
+let clickerAddrs = addrToUpn | distinct Addr;
+//
+// ---- Risky sign-ins after the click (Entra ID P2) -------------------------------
+// RiskLevelDuringSignIn: 10 = low, 50 = medium, 100 = high
+// NOT gated on ErrorCode == 0 alone any more: a failed-then-succeeded pattern
+// is signal, and aggregated risk is checked separately because Entra often
+// raises it hours-to-days after the fact — long past any click window.
+let clickerSignIns = materialize(
+    EntraIdSignInEvents
+    | where Timestamp > ago(lookback)
+    | extend AccountUpn = tolower(AccountUpn)
+    | where AccountUpn in (clickers)
+    | project SignInTime = Timestamp, AccountUpn, SignInIP = IPAddress,
+              // Country,   // pending probe P1 (column name)
+              SessionId,                       // pending probe P6
+              ErrorCode, RiskLevelDuringSignIn, RiskLevelAggregated, RiskState,
+              Application, ClientAppUsed
+);
+let riskySignIns =
+    clickerSignIns
+    | where ErrorCode == 0
+    | where RiskLevelDuringSignIn >= 50;
+let postClickRisk =
+    clicks
+    | join kind=inner riskySignIns on AccountUpn
+    | where SignInTime between (ClickTime .. (ClickTime + persistWindow))
+    | summarize RiskySignIns     = count(),
+                MaxRiskLevel     = max(RiskLevelDuringSignIn),
+                RiskySignInIPs   = make_set(SignInIP, 20),
+                RiskyApps        = make_set(Application, 10),
+                FirstRiskySignIn = min(SignInTime)
+              by AccountUpn;
+//
+// Aggregated / retroactive risk — UNGATED by the click window on purpose.
+let aggregatedRisk =
+    clickerSignIns
+    | where ErrorCode == 0
+    | where RiskLevelAggregated >= 50 or RiskState in ("atRisk", "confirmedCompromised")
+    | summarize MaxAggregatedRisk = max(RiskLevelAggregated),
+                RiskStates        = make_set(RiskState, 5),
+                LastAggRiskSignIn = max(SignInTime)
+              by AccountUpn;
+//
+// Session anomaly — the closest direct tell for AiTM cookie replay: one
+// SessionId used from more than one source IP. Benign causes exist (mobile
+// network handover, VPN); treat as a lead, not a verdict.
+let sessionAnomaly =
+    clickerSignIns
+    | where ErrorCode == 0
+    | where isnotempty(SessionId)
+    | summarize SessionIPs = dcount(SignInIP), IPs = make_set(SignInIP, 10)
+              by AccountUpn, SessionId
+    | where SessionIPs > 1
+    | summarize SplitSessions   = count(),
+                MaxSessionIPs   = max(SessionIPs),
+                SplitSessionIPs = make_set(IPs, 20)
+              by AccountUpn;
+//
+// ---- Mailbox changes after the click (MDA + O365 connector) ---------------------
+// Inbox rules + the rest of the BEC persistence kit: rule removal/disable
+// (hiding), SMTP forwarding, mailbox/SendAs permission grants.
+let mailboxOps =
+    CloudAppEvents
+    | where Timestamp > ago(lookback)
+    | where ActionType in ("New-InboxRule", "Set-InboxRule", "UpdateInboxRules",
+                           "Remove-InboxRule", "Disable-InboxRule",
+                           "Add-MailboxPermission", "Add-RecipientPermission")
+        or (ActionType == "Set-Mailbox"
+            and RawEventData has_any ("ForwardingSmtpAddress", "ForwardingAddress",
+                                      "DeliverToMailboxAndForward"))
+    | extend Addr = tolower(AccountId)                // probe P4
+    | where Addr in (clickerAddrs)
+    | join kind=inner addrToUpn on Addr
+    | project MailboxTime = Timestamp, AccountUpn, MailboxAction = ActionType;
+let postClickMailbox =
+    clicks
+    | join kind=inner mailboxOps on AccountUpn
+    | where MailboxTime between (ClickTime .. (ClickTime + persistWindow))
+    | summarize MailboxOps         = count(),
+                MailboxActions     = make_set(MailboxAction, 10),
+                FirstMailboxChange = min(MailboxTime)
+              by AccountUpn;
+//
+// ---- Auth-method registration after the click (probe P7) ------------------------
+// The most common single ATO persistence step in M365: the attacker enrols
+// their own MFA method so the stolen session stops mattering. Entra audit
+// surfaces this through CloudAppEvents; ActionType strings are NOT verified
+// in this tenant — if P7 disagrees, this leg fails SILENT.
+let authMethodOps =
+    CloudAppEvents
+    | where Timestamp > ago(lookback)
+    | where ActionType has_any ("User registered security info",
+                                "User changed default security info",
+                                "User deleted security info",
+                                "Admin registered security info",
+                                "Reset user password", "Change user password",
+                                "Update user")
+    // "Update user" is noisy on its own — keep it only when the modified
+    // properties actually touch strong auth / credentials.
+    | where ActionType != "Update user"
+         or RawEventData has_any ("StrongAuthenticationMethod",
+                                  "StrongAuthenticationUserDetails",
+                                  "StrongAuthenticationPhoneAppDetail")
+    | extend Addr = tolower(coalesce(tostring(RawEventData.UserId), AccountId))
+    | where Addr in (clickerAddrs)
+    | join kind=inner addrToUpn on Addr
+    | project AuthTime = Timestamp, AccountUpn, AuthAction = ActionType;
+let postClickAuth =
+    clicks
+    | join kind=inner authMethodOps on AccountUpn
+    | where AuthTime between (ClickTime .. (ClickTime + persistWindow))
+    | summarize AuthMethodOps      = count(),
+                AuthMethodActions  = make_set(AuthAction, 10),
+                FirstAuthChange    = min(AuthTime)
+              by AccountUpn;
+//
+// ---- OAuth consent / app registration after the click (probe P7) ----------------
+// The leg that matters most for this chapter's threat model and is invisible
+// to every other gate here: consent an app with Mail.Send, then send internal
+// phish over Graph. No interactive sign-in, no inbox rule, no click.
+let consentOps =
+    CloudAppEvents
+    | where Timestamp > ago(lookback)
+    | where ActionType has_any ("Consent to application",
+                                "Add OAuth2PermissionGrant",
+                                "Add delegated permission grant",
+                                "Add app role assignment grant to user",
+                                "Add service principal",
+                                "Add service principal credentials",
+                                "Add application",
+                                "Update application - Certificates and secrets management")
+    | extend Addr = tolower(coalesce(tostring(RawEventData.UserId), AccountId))
+    | where Addr in (clickerAddrs)
+    | join kind=inner addrToUpn on Addr
+    | extend ConsentApp = tostring(RawEventData.Target)
+    | project ConsentTime = Timestamp, AccountUpn,
+              ConsentAction = ActionType, ConsentApp;
+let postClickConsent =
+    clicks
+    | join kind=inner consentOps on AccountUpn
+    | where ConsentTime between (ClickTime .. (ClickTime + persistWindow))
+    | summarize ConsentOps      = count(),
+                ConsentActions  = make_set(ConsentAction, 10),
+                ConsentApps     = make_set(ConsentApp, 10),
+                FirstConsent    = min(ConsentTime)
+              by AccountUpn;
+//
+// ---- Device registration after the click (probe P7) -----------------------------
+// Persistence in the ACCOUNT, not on an endpoint: register a device to satisfy
+// a compliant-device conditional-access policy.
+let deviceOps =
+    CloudAppEvents
+    | where Timestamp > ago(lookback)
+    | where ActionType has_any ("Register device", "Add device",
+                                "Add registered owner to device",
+                                "Add registered users to device")
+    | extend Addr = tolower(coalesce(tostring(RawEventData.UserId), AccountId))
+    | where Addr in (clickerAddrs)
+    | join kind=inner addrToUpn on Addr
+    | project DeviceTime = Timestamp, AccountUpn, DeviceAction = ActionType;
+let postClickDevice =
+    clicks
+    | join kind=inner deviceOps on AccountUpn
+    | where DeviceTime between (ClickTime .. (ClickTime + persistWindow))
+    | summarize DeviceOps     = count(),
+                DeviceActions = make_set(DeviceAction, 5),
+                FirstDeviceOp = min(DeviceTime)
+              by AccountUpn;
+//
+// ---- Mail sent after the click (internal phish of any type) ---------------------
+// Intra-org/Outbound only, so spoofed inbound "from" the clicker doesn't count.
+// Everyone sends mail — only a burst (>= mailBurstAlert distinct recipients)
+// or a resend of the confirmed lure subject escalates; the rest is context.
+let sentMail =
+    EmailEvents
+    | where Timestamp > ago(lookback)
+    | where EmailDirection in ("Intra-org", "Outbound")
+    | extend Addr = tolower(SenderFromAddress)
+    | where Addr in (clickerAddrs)                    // was: assumed SMTP == UPN
+    | join kind=inner addrToUpn on Addr
+    | project SendTime = Timestamp, AccountUpn, SentMsgId = NetworkMessageId,
+              SentSubject = Subject, SentRecipient = tolower(RecipientEmailAddress),
+              SentDirection = EmailDirection;
+let postClickMail =
+    clicks
+    | join kind=inner sentMail on AccountUpn
+    | where SendTime between (ClickTime .. (ClickTime + postClickWindow))
+    | summarize SentEmails         = dcount(SentMsgId),
+                SentRecipients     = dcount(SentRecipient),
+                InternalRecipients = dcountif(SentRecipient, SentDirection == "Intra-org"),
+                LureResends        = dcountif(SentMsgId, isnotempty(targetSubject)
+                                        and SentSubject contains targetSubject),
+                SentSubjects       = make_set(SentSubject, 10),
+                FirstSend          = min(SendTime)
+              by AccountUpn;
+//
+// ---- SharePoint sharing bursts after the click (are they spreading it?) ---------
+let shareOps =
+    CloudAppEvents
+    | where Timestamp > ago(lookback)
+    | where Application == "Microsoft SharePoint Online"
+    | where ActionType in ("SharingInvitationCreated", "AnonymousLinkCreated",
+                           "SecureLinkCreated", "SecureLinkUpdated",
+                           "AddedToSecureLink", "SharingSet", "CompanyLinkCreated")
+    | extend Addr = tolower(coalesce(tostring(RawEventData.UserId), AccountDisplayName))
+    | where Addr in (clickerAddrs)
+    | join kind=inner addrToUpn on Addr
+    | extend Target = tolower(tostring(RawEventData.TargetUserOrGroupName))
+    | project OpTime = Timestamp, AccountUpn, ActionType, Target;
+let postClickShareOps =
+    clicks
+    | join kind=inner shareOps on AccountUpn
+    | where OpTime between (ClickTime .. (ClickTime + postClickWindow))
+    | summarize ShareOps             = count(),
+                AnonymousLinks       = countif(ActionType == "AnonymousLinkCreated"),
+                ExternalShareTargets = dcountif(Target, Target contains "@"
+                                        and not(Target has_any (ownEmailDomains))),
+                InternalShareTargets = dcountif(Target, Target contains "@"
+                                        and Target has_any (ownEmailDomains)),
+                FirstShareOp         = min(OpTime)
+              by AccountUpn;
+//
+// ---- Identity context: AccountObjectId enables user-level Take actions ----------
+// (already resolved above in clickerIds)
+//
+// ---- One row per clicker ---------------------------------------------------------
+clicks
+| summarize Clicks         = count(),
+            FirstClick     = min(ClickTime),
+            LastClick      = max(ClickTime),
+            SampleSubjects = make_set(Subject, 10),
+            SampleSenders  = make_set(SenderFromAddress, 10),
+            ClickedUrls    = make_set(Url, 10),
+            ClickIPs       = make_set(ClickIP, 10)
+          by AccountUpn
+| join kind=leftouter postClickRisk     on AccountUpn
+| join kind=leftouter aggregatedRisk    on AccountUpn
+| join kind=leftouter sessionAnomaly    on AccountUpn
+| join kind=leftouter postClickAuth     on AccountUpn
+| join kind=leftouter postClickConsent  on AccountUpn
+| join kind=leftouter postClickDevice   on AccountUpn
+| join kind=leftouter postClickMailbox  on AccountUpn
+| join kind=leftouter postClickMail     on AccountUpn
+| join kind=leftouter postClickShareOps on AccountUpn
+| join kind=leftouter clickerIds        on AccountUpn
+| extend Verdict = case(
+    // --- Account persistence established: treat as compromised, no debate ---
+    isnotempty(FirstAuthChange),
+        "P0 - AUTH METHOD registered/changed after click - account persistence, evict now",
+    isnotempty(FirstConsent),
+        "P0 - OAUTH CONSENT / app registration after click - can send mail without signing in",
+    isnotempty(FirstRiskySignIn) and isnotempty(FirstMailboxChange),
+        "P0 - Risky sign-in AND mailbox change after click - treat as compromised",
+    // --- Actively spreading ---
+    LureResends > 0,
+        "P0 - Re-sent the confirmed lure subject - actively spreading, go to 5",
+    SentRecipients >= mailBurstAlert
+        or InternalShareTargets >= shareBurstAlert or ExternalShareTargets >= shareBurstAlert,
+        "P0 - Mass-mail / sharing burst after click - actively spreading, go to 5",
+    // --- Strong single indicators ---
+    isnotempty(FirstDeviceOp),
+        "P1 - DEVICE registered after click - CA-policy persistence, check the device",
+    isnotempty(FirstMailboxChange),
+        "P1 - Mailbox rule / forwarding change after click",
+    isnotempty(FirstRiskySignIn),
+        "P1 - Risky sign-in after click",
+    isnotempty(LastAggRiskSignIn),
+        "P1 - Entra AGGREGATED risk on this account - retroactive verdict, no window gate",
+    SplitSessions > 0,
+        "P1 - One session ID from multiple IPs - possible AiTM cookie replay, check 6",
+    // --- Context ---
+    isnotempty(FirstShareOp),
+        "P2 - Share activity after click - review the shared items",
+        "P3 - Click only - lure is confirmed malicious, reset password + revoke sessions")
+// Ready-to-paste element for 6's knownClickers and 3b's suspectUpns
+| extend PasteUpn = strcat('"', AccountUpn, '",')
+| project Verdict, PasteUpn, AccountUpn, AccountObjectId, Department, JobTitle,
+    Clicks, FirstClick, LastClick, SampleSubjects, SampleSenders,
+    AuthMethodOps, AuthMethodActions, FirstAuthChange,
+    ConsentOps, ConsentActions, ConsentApps, FirstConsent,
+    DeviceOps, DeviceActions, FirstDeviceOp,
+    RiskySignIns, MaxRiskLevel, RiskySignInIPs, RiskyApps, FirstRiskySignIn,
+    MaxAggregatedRisk, RiskStates, LastAggRiskSignIn,
+    SplitSessions, MaxSessionIPs, SplitSessionIPs,
+    MailboxOps, MailboxActions, FirstMailboxChange,
+    SentEmails, SentRecipients, InternalRecipients, LureResends, SentSubjects, FirstSend,
+    ShareOps, AnonymousLinks, ExternalShareTargets, InternalShareTargets, FirstShareOp,
+    ClickedUrls, ClickIPs
+| order by Verdict asc, Clicks desc

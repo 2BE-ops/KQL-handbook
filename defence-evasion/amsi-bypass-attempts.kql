@@ -1,0 +1,209 @@
+// =====================================================================
+// AMSI bypass / tampering attempts — MDE Advanced Hunting — v2
+//
+// Changes from v1, driven by triage of live results:
+//   * FIXED: v2-downgrade regex matched "--version 2>&1" inside unrelated
+//     commands (gh --version, python --version). Now requires whitespace
+//     immediately before -v, so a double dash no longer matches.
+//   * FIXED: AMSI provider *creation* was ranked Critical. Creation is how
+//     legitimate AV registers itself (MsMpEng.exe, bdservicehost.exe).
+//     Deletion is the attack. Creation is now only scored when the
+//     initiating process is not a known security product.
+//   * ADDED: signer enrichment for non-system amsi.dll loads, so a
+//     Microsoft-signed copy is separated from an unknown binary.
+//   * ADDED: baseline exclusion block populated from triage.
+// =====================================================================
+let Lookback = 30d;
+let AmsiInternals = dynamic([
+    "amsiInitFailed","AmsiUtils","AmsiContext","AmsiSession",
+    "AmsiScanBuffer","AmsiScanString","AmsiOpenSession","AmsiInitialize"]);
+let PatchPrimitives = dynamic([
+    "VirtualProtect","WriteProcessMemory","GetProcAddress","LoadLibrary",
+    "GetDelegateForFunctionPointer","Marshal.Copy","NonPublic","GetField",
+    "SetValue","Reflection"]);
+// Security products legitimately registering an AMSI provider
+let KnownAvProcesses = dynamic([
+    "msmpeng.exe","mssense.exe","bdservicehost.exe","bdagent.exe","vsserv.exe",
+    "ccsvchst.exe","avp.exe","avpui.exe","mcshield.exe","masvc.exe",
+    "sentinelagent.exe","csfalconservice.exe","sophosfs.exe","savservice.exe",
+    "elastic-endpoint.exe","xagt.exe","cylancesvc.exe","tmbmsrv.exe",
+    "egui.exe","ekrn.exe","avgnt.exe","sched.exe","msseces.exe"]);
+// ---- Baselines confirmed benign during triage ------------------------
+let BaselinedDllHashes = dynamic([
+    // Example: some ITSM products (e.g. Ivanti HEAT Service Manager) ship
+    // amsi.dll in their own IIS app bin dir. NOTE: keep a hash commented
+    // until the signer check confirms it — see the companion "verify a
+    // baselined DLL" query at the bottom.
+    // "<sha1-of-verified-benign-dll>"
+    ""]);
+// ----------------------------------------------------------------------
+union isfuzzy=true
+(
+    // --- A. PowerShell command / script block telemetry --------------------
+    // Verify this branch has data first:
+    //   DeviceEvents | where ActionType == "PowerShellCommand" | count
+    DeviceEvents
+    | where Timestamp > ago(Lookback)
+    | where ActionType == "PowerShellCommand"
+    | extend Cmd = tostring(parse_json(AdditionalFields).Command)
+    | where Cmd has_any (AmsiInternals)
+         or (Cmd contains "amsi" and Cmd has_any (PatchPrimitives))
+    | extend Severity  = "1-Critical: AMSI internals referenced in PowerShell",
+             Technique = "In-memory AMSI patch / reflection",
+             Evidence  = substring(Cmd, 0, 1000),
+             Source    = "DeviceEvents/PowerShellCommand"
+    | project Timestamp, Severity, Technique, DeviceId, DeviceName, ReportId,
+              Evidence, Source, InitiatingProcessFileName,
+              InitiatingProcessCommandLine, InitiatingProcessAccountName
+),
+(
+    // --- B. AMSI internals hidden in base64 -EncodedCommand ---------------
+    DeviceProcessEvents
+    | where Timestamp > ago(Lookback)
+    | where FileName in~ ("powershell.exe","pwsh.exe","powershell_ise.exe")
+    | where ProcessCommandLine matches regex @"(?i)(^|\s)-e(nc|ncoded|ncodedcommand)?\s"
+    | extend B64 = extract(@"(?i)(?:^|\s)-e(?:nc|ncoded|ncodedcommand)?\s+([A-Za-z0-9+/=]{24,})", 1, ProcessCommandLine)
+    | where isnotempty(B64)
+    | extend Decoded = replace_string(base64_decode_tostring(B64), "\u0000", "")
+    | where Decoded has_any (AmsiInternals)
+         or (Decoded contains "amsi" and Decoded has_any (PatchPrimitives))
+    | extend Severity  = "1-Critical: AMSI internals in encoded command",
+             Technique = "Obfuscated AMSI tampering (-EncodedCommand)",
+             Evidence  = strcat("DECODED: ", substring(Decoded, 0, 900)),
+             Source    = "DeviceProcessEvents"
+    | project Timestamp, Severity, Technique, DeviceId, DeviceName, ReportId,
+              Evidence, Source, InitiatingProcessFileName,
+              InitiatingProcessCommandLine, InitiatingProcessAccountName
+),
+(
+    // --- C. PowerShell v2 downgrade — no AMSI in PSv2 ---------------------
+    // (^|\s) is load-bearing: without it "gh --version 2>&1" matches.
+    DeviceProcessEvents
+    | where Timestamp > ago(Lookback)
+    | where FileName in~ ("powershell.exe","powershell_ise.exe")
+    | where ProcessCommandLine matches regex @"(?i)(^|\s)-v(er|ers|ersi|ersio|ersion)?[\s:]+2(\.0)?(\s|$|""|')"
+    // SCOM / Microsoft Monitoring Agent legitimately uses -version 2
+    | where not(InitiatingProcessFileName =~ "monitoringhost.exe"
+                and ProcessCommandLine has "Microsoft Monitoring Agent")
+    | extend Severity  = "2-High: PowerShell v2 downgrade (AMSI not present)",
+             Technique = "Engine downgrade to evade AMSI",
+             Evidence  = ProcessCommandLine,
+             Source    = "DeviceProcessEvents"
+    | project Timestamp, Severity, Technique, DeviceId, DeviceName, ReportId,
+              Evidence, Source, InitiatingProcessFileName,
+              InitiatingProcessCommandLine, InitiatingProcessAccountName
+),
+(
+    // --- D. Registry-based AMSI disablement -------------------------------
+    DeviceRegistryEvents
+    | where Timestamp > ago(Lookback)
+    | where
+        // Provider UNREGISTERED — the actual bypass
+        (RegistryKey has @"\Microsoft\AMSI\Providers"
+             and ActionType in ("RegistryKeyDeleted","RegistryValueDeleted"))
+        // Provider REGISTERED by something that is not a known AV product
+        or (RegistryKey has @"\Microsoft\AMSI\Providers"
+             and ActionType == "RegistryKeyCreated"
+             and tolower(InitiatingProcessFileName) !in (KnownAvProcesses))
+        // Windows Script Host / scripting AMSI switch
+        or (RegistryKey has @"\Windows Script\Settings"
+             and RegistryValueName =~ "AmsiEnable" and RegistryValueData == "0")
+        // Office macro runtime scanning scope disabled
+        or (RegistryValueName =~ "MacroRuntimeScanScope" and RegistryValueData == "0")
+    | extend Severity = case(
+        ActionType in ("RegistryKeyDeleted","RegistryValueDeleted"),
+            "1-Critical: AMSI provider unregistered",
+        ActionType == "RegistryKeyCreated",
+            "2-High: AMSI provider registered by non-AV process",
+            "2-High: AMSI disabled via registry")
+    | extend Technique = "Configuration-based AMSI disablement",
+             Evidence  = strcat(RegistryKey, " | ", RegistryValueName, " = ",
+                                RegistryValueData, " (was: ", PreviousRegistryValueData,
+                                ") [", ActionType, "]"),
+             Source    = "DeviceRegistryEvents"
+    | project Timestamp, Severity, Technique, DeviceId, DeviceName, ReportId,
+              Evidence, Source, InitiatingProcessFileName,
+              InitiatingProcessCommandLine, InitiatingProcessAccountName
+),
+(
+    // --- E. amsi.dll loaded from a non-system path, with signer context ---
+    DeviceImageLoadEvents
+    | where Timestamp > ago(Lookback)
+    | where FileName =~ "amsi.dll"
+    | where FolderPath !contains @"\Windows\System32"
+        and FolderPath !contains @"\Windows\SysWOW64"
+        and FolderPath !contains @"\Windows\WinSxS"
+        and FolderPath !contains @"\Windows\servicing"
+    | where SHA1 !in (BaselinedDllHashes)
+    | join kind=leftouter (
+        DeviceFileCertificateInfo
+        | summarize by SHA1, IsSigned, IsTrusted, Signer
+      ) on SHA1
+    | extend Severity = case(
+        Signer has "Microsoft",     "3-Medium: non-system amsi.dll (Microsoft-signed copy)",
+        IsTrusted == true,          "2-High: non-system amsi.dll (third-party signed)",
+                                    "1-Critical: non-system amsi.dll (unsigned/untrusted)")
+    | extend Technique = "AMSI DLL sideloading / hijack",
+             Evidence  = strcat("Loaded: ", FolderPath, " | SHA1 ", SHA1,
+                                " | Signed: ", tostring(IsSigned),
+                                " | Trusted: ", tostring(IsTrusted),
+                                " | Signer: ", coalesce(Signer, "UNKNOWN")),
+             Source    = "DeviceImageLoadEvents"
+    | project Timestamp, Severity, Technique, DeviceId, DeviceName, ReportId,
+              Evidence, Source, InitiatingProcessFileName,
+              InitiatingProcessCommandLine, InitiatingProcessAccountName
+),
+(
+    // --- F. Defender script scanning turned off ---------------------------
+    DeviceProcessEvents
+    | where Timestamp > ago(Lookback)
+    | where ProcessCommandLine has "Set-MpPreference"
+    | where ProcessCommandLine has_any ("DisableScriptScanning","DisableIOAVProtection",
+                                        "DisableRealtimeMonitoring","DisableBehaviorMonitoring")
+    | where ProcessCommandLine has_any ("$true"," 1","True")
+    | extend Severity  = "2-High: Defender script/realtime scanning disabled",
+             Technique = "Set-MpPreference disablement",
+             Evidence  = ProcessCommandLine,
+             Source    = "DeviceProcessEvents"
+    | project Timestamp, Severity, Technique, DeviceId, DeviceName, ReportId,
+              Evidence, Source, InitiatingProcessFileName,
+              InitiatingProcessCommandLine, InitiatingProcessAccountName
+)
+| summarize Hits = count(),
+            FirstSeen = min(Timestamp),
+            LastSeen  = max(Timestamp),
+            Techniques = make_set(Technique, 6),
+            Sources    = make_set(Source, 6),
+            SampleEvidence = take_any(Evidence),
+            SampleParent   = take_any(InitiatingProcessFileName)
+    by Severity, DeviceName, InitiatingProcessAccountName
+| sort by Severity asc, Hits desc
+//
+// =====================================================================
+// VERIFY A BASELINED DLL before trusting it
+// =====================================================================
+// DeviceFileCertificateInfo
+// | where SHA1 == "<sha1-of-candidate-dll>"
+// | project SHA1, IsSigned, IsTrusted, Signer, Issuer, SignatureType, CertificateCreationTime
+//
+// // When and how did it get there? (30d AH retention may predate this)
+// DeviceFileEvents
+// | where Timestamp > ago(30d)
+// | where FileName =~ "amsi.dll" and FolderPath contains "<vendor-app-dir>"
+// | project Timestamp, DeviceName, ActionType, FolderPath, SHA256,
+//           InitiatingProcessFileName, InitiatingProcessCommandLine,
+//           InitiatingProcessAccountName
+// | sort by Timestamp asc
+//
+// =====================================================================
+// COMPANION — Defender's own AMSI / tampering detections
+// Best coverage for fileless bypasses that leave no command-line trace.
+// =====================================================================
+// AlertInfo
+// | where Timestamp > ago(30d)
+// | join kind=inner AlertEvidence on AlertId
+// | where Title has_any ("AMSI","Antimalware Scan Interface","tampering",
+//                        "script scanning","Defender tampering")
+// | project Timestamp, Title, Severity, Category, DeviceName, AccountName,
+//           EntityType, EvidenceRole, FileName, ProcessCommandLine, AlertId
+// | sort by Timestamp desc

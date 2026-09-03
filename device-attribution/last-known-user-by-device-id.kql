@@ -1,0 +1,43 @@
+// =====================================================================
+// Last known user of a device — by DeviceId
+// Unions logon, process and network telemetry so a stale or absent
+// DeviceLogonEvents feed cannot leave the question unanswered.
+// One row per (device, user) with first/last seen and which sources saw it.
+// =====================================================================
+let deviceId = "";        // ← target DeviceId
+union
+(
+    // True logons (if available)
+    DeviceLogonEvents
+    | where Timestamp > ago(30d)
+    | where DeviceId == deviceId
+    | extend UserName = strcat(AccountDomain, "\\", AccountName)
+    | project Timestamp, DeviceId, DeviceName, UserName, Source = "DeviceLogonEvents"
+),
+(
+    // Process executions – who was running what
+    DeviceProcessEvents
+    | where Timestamp > ago(30d)
+    | where DeviceId == deviceId
+    | extend UserName = strcat(AccountDomain, "\\", AccountName)
+    | project Timestamp, DeviceId, DeviceName, UserName, Source = "DeviceProcessEvents"
+),
+(
+    // Network activity – user from initiating process account
+    DeviceNetworkEvents
+    | where Timestamp > ago(30d)
+    | where DeviceId == deviceId
+    | extend UserName = strcat(
+        tostring(InitiatingProcessAccountDomain),
+        "\\",
+        tostring(InitiatingProcessAccountName)
+    )
+    | where isnotempty(InitiatingProcessAccountName)
+    | project Timestamp, DeviceId, DeviceName, UserName, Source = "DeviceNetworkEvents"
+)
+| summarize
+    FirstSeen = min(Timestamp),
+    LastSeen  = max(Timestamp),
+    Sources   = make_set(Source)
+    by DeviceId, DeviceName, UserName
+| top 20 by LastSeen desc

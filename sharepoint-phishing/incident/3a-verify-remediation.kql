@@ -1,0 +1,84 @@
+// ============================================================================
+// incident/3A — VERIFY PURGE: Where is every copy of the campaign mail NOW?
+// FLOW     : 2 (same keys) ─▶ purge via Take actions ─▶ THIS to confirm
+// TWIN     : 3b verifies the ACCOUNT was evicted. A campaign is not closed
+//            until BOTH read clean — purging every copy of a lure from an
+//            account the attacker still holds achieves nothing.
+// ----------------------------------------------------------------------------
+// Question : After remediation: how many copies are still in Inbox/Junk, how
+//            many are quarantined or gone — per sharer.
+// Surface  : Advanced Hunting, manual, after every purge. Re-run until the
+//            status reads fully remediated.
+// Tables   : EmailEvents, EmailUrlInfo, EmailPostDeliveryEvents
+// Inputs   : targetTenant (required) — same key you used in 2.
+//            targetSharer (optional) — scope to one sharer inside a legit
+//            tenant so the verdict isn't polluted by legitimate mail.
+//            INTERNAL WAVE: set targetTenant = "contoso" and targetSharer =
+//            the compromised account's /personal/ segment to verify a purge
+//            done via 5 — own tenant is deliberately allowed here.
+// Next     : 3b (did the eviction hold?)
+// Notes    : No EmailDirection filter (internal waves aren't Inbound).
+//            Post-delivery action vocabulary pending probe P2 (_probes.kql).
+// ============================================================================
+let lookback     = 7d;                    // up to 30d (AH retention cap)
+let targetTenant = "";                    // ← REQUIRED (may be our own tenant — see header)
+let targetSharer = "";                    // ← optional /personal/ segment
+let tenantPattern = @"https?://([a-z0-9-]+?)(?:-my)?\.sharepoint\.com";
+//
+let campaignMsgs = EmailUrlInfo
+    | where Timestamp > ago(lookback)
+    | where Url has "sharepoint.com"
+    | extend SharePointTenant = extract(tenantPattern, 1, tolower(Url))
+    | where SharePointTenant =~ targetTenant
+    | where isempty(targetSharer) or Url contains targetSharer
+    | extend SharerKey = coalesce(
+        extract(@"/personal/([^/]+)/", 1, tolower(Url)),
+        strcat("site:", extract(@"\.sharepoint\.com/sites/([^/]+)/", 1, tolower(Url))))
+    | extend SharerKey = iff(isempty(SharerKey) or SharerKey == "site:", "(no sharer path)", SharerKey)
+    | distinct NetworkMessageId, SharePointTenant, SharerKey, Url;
+//
+// Latest post-delivery action per (message, recipient)
+let postDelivery = EmailPostDeliveryEvents
+    | where Timestamp > ago(lookback)
+    | summarize arg_max(Timestamp, ActionType, DeliveryLocation)
+        by NetworkMessageId, RecipientEmailAddress
+    | project NetworkMessageId, RecipientEmailAddress,
+              LatestPostDeliveryAction   = ActionType,
+              LatestPostDeliveryLocation = DeliveryLocation;
+//
+EmailEvents
+| where Timestamp > ago(lookback)
+| join kind=inner campaignMsgs on NetworkMessageId
+| join kind=leftouter postDelivery on NetworkMessageId, RecipientEmailAddress
+// Best-available current location: post-delivery event, else the
+// pipeline-maintained LatestDeliveryLocation, else original delivery.
+| extend FinalLocation = coalesce(LatestPostDeliveryLocation, LatestDeliveryLocation, DeliveryLocation)
+| extend FinalAction   = coalesce(LatestPostDeliveryAction, EmailAction)
+| summarize
+    Recipients          = dcount(RecipientEmailAddress),
+    SampleSubjects      = make_set(Subject, 5),
+    SampleSenders       = make_set(SenderFromAddress, 5),
+    DeliveredCount      = countif(DeliveryAction == "Delivered"),
+    StillInInbox        = countif(FinalLocation startswith "Inbox"),
+    StillInJunk         = countif(FinalLocation has "Junk"),
+    InQuarantine        = countif(FinalLocation has "Quarantine"),
+    Removed             = countif(FinalLocation has "Deleted"
+                              or FinalAction has "delete"
+                              or FinalAction has "ZAP"),
+    NMIDsInInbox        = make_set_if(NetworkMessageId, FinalLocation startswith "Inbox", 500),
+    LocationBreakdown   = make_set(FinalLocation, 10),
+    PostDeliveryActions = make_set(LatestPostDeliveryAction, 10),
+    SampleUrl           = take_any(Url),
+    FirstSeen           = min(Timestamp),
+    LastSeen            = max(Timestamp)
+    by SharePointTenant, SharerKey
+| extend RemediationStatus = case(
+    StillInInbox == 0 and StillInJunk == 0, "OK - Fully remediated",
+    StillInInbox > 0, strcat("ALERT - ", StillInInbox, " still in Inbox"),
+    StillInJunk > 0, strcat("WARN - ", StillInJunk, " in Junk only"),
+    "Check manually")
+| project SharePointTenant, SharerKey, Recipients, RemediationStatus,
+    StillInInbox, StillInJunk, InQuarantine, Removed, NMIDsInInbox,
+    LocationBreakdown, PostDeliveryActions, SampleSubjects, SampleUrl,
+    FirstSeen, LastSeen
+| order by StillInInbox desc, Recipients desc

@@ -1,0 +1,106 @@
+// ============================================================================
+// incident/6 — VICTIM SWEEP: who else did the attacker sign in as?
+// FLOW     : 4 (RiskySignInIPs / SplitSessionIPs of a confirmed-compromised
+//            account) ─▶ THIS ─▶ new UPNs back into 4, 5 and 3b
+// ----------------------------------------------------------------------------
+// Why this exists : every other query in the chapter runs FORWARDS from a
+//            click. That only ever finds victims whose click was logged.
+//            Clicks go unlogged all the time — Safe Links doesn't cover every
+//            path, users open the lure on a personal phone, the lure gets
+//            forwarded outside the original recipient set. This query runs
+//            BACKWARDS from confirmed-bad sign-in infrastructure and finds the
+//            victims triage never saw. Run it on every confirmed ATO.
+//
+// Question : Across the whole tenant, which accounts had successful sign-ins
+//            from the attacker's IPs, and which of those are new to us?
+// Surface  : Advanced Hunting, manual.
+// Tables   : EntraIdSignInEvents, IdentityInfo
+// Inputs   : attackerIPs   — REQUIRED. From 4's RiskySignInIPs /
+//                            SplitSessionIPs on a CONFIRMED-compromised
+//                            account. Do not seed this with IPs you have not
+//                            confirmed: a shared NAT/VPN egress will return
+//                            half the org.
+//            knownClickers — the UPNs 4 already gave you. Rows for these are
+//                            kept but marked "known"; anything else is the
+//                            point of the query.
+//            lookback      — widen to 30d for an older campaign.
+// Reading  : NEW rows with successful sign-ins are unconfirmed victims. Treat
+//            them exactly like a 4 P0/P1: evict, then run 4 (targetSender /
+//            targetSubject shape) and 3b against them.
+// Caveat   : IP is a weak pivot on its own. Before acting on a NEW row, check
+//            NonAttackerIPs — if the same account also signs in from the same
+//            IP routinely across weeks, that IP is shared infrastructure and
+//            this whole sweep is noise. SessionId reuse (probe P6) is the
+//            stronger signal where it is populated.
+// Next     : new UPNs ─▶ 4 (confirm) ─▶ 5 (spread) ─▶ 3b (eviction held)
+// ============================================================================
+let lookback      = 7d;                   // up to 30d
+let baselineDays  = 30d;                  // for the shared-infrastructure check
+let attackerIPs   = dynamic([
+    // "203.0.113.45",   ← from 4's RiskySignInIPs / SplitSessionIPs
+]);
+let knownClickers = dynamic([
+    // "user@contoso.com", ← 4's PasteUpn cells, so new victims stand out
+]);
+let seeded = array_length(attackerIPs) > 0;
+//
+let hits = materialize(
+    EntraIdSignInEvents
+    | where Timestamp > ago(lookback)
+    | where seeded                        // no seed ⇒ empty, never a tenant sweep
+    | where IPAddress in (attackerIPs)
+    | extend AccountUpn = tolower(AccountUpn)
+    | summarize SignIns        = count(),
+                Successes      = countif(ErrorCode == 0),
+                Failures       = countif(ErrorCode != 0),
+                IPsUsed        = make_set(IPAddress, 10),
+                SessionIds     = make_set(SessionId, 10),   // probe P6
+                Apps           = make_set(Application, 10),
+                ClientApps     = make_set(ClientAppUsed, 5),
+                MaxRisk        = max(RiskLevelDuringSignIn),
+                MaxAggRisk     = max(RiskLevelAggregated),
+                FirstSignIn    = min(Timestamp),
+                LastSignIn     = max(Timestamp)
+              by AccountUpn
+);
+//
+// Shared-infrastructure check: has this account used these IPs historically,
+// well before the campaign? If so the IP is probably a VPN/NAT egress.
+let baseline =
+    EntraIdSignInEvents
+    | where Timestamp between (ago(baselineDays) .. ago(lookback))
+    | where seeded
+    | extend AccountUpn = tolower(AccountUpn)
+    | where AccountUpn in ((hits | distinct AccountUpn))
+    | summarize PriorSignInsFromAttackerIPs = countif(IPAddress in (attackerIPs)),
+                PriorSignInsTotal           = count(),
+                NonAttackerIPs              = dcountif(IPAddress, IPAddress !in (attackerIPs))
+              by AccountUpn;
+//
+let ids = IdentityInfo
+    | extend AccountUpn = tolower(AccountUpn)
+    | summarize arg_max(Timestamp, AccountObjectId, Department, JobTitle) by AccountUpn
+    | project AccountUpn, AccountObjectId, Department, JobTitle;
+//
+hits
+| join kind=leftouter baseline on AccountUpn
+| join kind=leftouter ids      on AccountUpn
+| extend PriorSignInsFromAttackerIPs = coalesce(PriorSignInsFromAttackerIPs, 0)
+| extend Known = AccountUpn in (knownClickers)
+| extend Verdict = case(
+    PriorSignInsFromAttackerIPs > 0,
+        "IGNORE - account used this IP before the campaign - shared egress, not attacker infra",
+    Successes > 0 and not(Known),
+        "P0 - NEW VICTIM - successful sign-in from attacker IP, not in the clicker list",
+    Successes > 0 and Known,
+        "P1 - Known clicker, confirmed sign-in from attacker IP",
+    Failures > 0 and not(Known),
+        "P2 - Failed attempts only from attacker IP - targeted, not (yet) compromised",
+        "P3 - Failed attempts, known clicker")
+| extend PasteUpn = strcat('"', AccountUpn, '",')
+| project Verdict, PasteUpn, AccountUpn, AccountObjectId, Department, JobTitle, Known,
+    SignIns, Successes, Failures, MaxRisk, MaxAggRisk,
+    IPsUsed, SessionIds, Apps, ClientApps,
+    PriorSignInsFromAttackerIPs, NonAttackerIPs,
+    FirstSignIn, LastSignIn
+| order by Verdict asc, Successes desc

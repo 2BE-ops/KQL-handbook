@@ -1,0 +1,91 @@
+// ============================================================================
+// detection/3 — MALICIOUS CANDIDATES: paste-ready maliciousTenants entries
+// FLOW     : 1 flags "Lean MALICIOUS", or an incident concludes ─▶ confirm
+//            with 2 (dossier) ─▶ copy PasteLine into maliciousTenants in
+//            00-shared-lists ─▶ re-paste the list into its consumers
+//            (0a/0b rules, incident/1a/1b, 1)
+// ----------------------------------------------------------------------------
+// Question : Which external SP tenants have HARD bad evidence in the last
+//            30 days — Defender threat verdicts, ZAP/post-delivery removals,
+//            delivery blocks, or blocked clicks?
+// Surface  : Advanced Hunting, manual — after the weekly review or an incident
+// Tables   : EmailUrlInfo, EmailEvents, EmailPostDeliveryEvents, UrlClickEvents
+// Caution  : "Malicious tenant" can be ONE compromised user on a legit
+//            domain. A tenant that is ALSO on the trusted list is surfaced
+//            with ConflictWarning instead of being hidden — resolve it via
+//            the dossier's per-sharer section before listing either way.
+//            Remember: entries make the detection/0a rule alert instantly,
+//            bypass every 0b gate (and P0/P1 in incident/1a/1b) — they
+//            never auto-block.
+// Embeds   : ownTenants, trustedTenants, maliciousTenants
+// ============================================================================
+let lookback = 30d;                     // AH retention cap
+let minBadEvidence = 2;                 // distinct bad messages before suggesting
+let ownTenants = dynamic(["contoso"]);
+// ---- Classification lists — sync from 00-shared-lists.kql -------------------
+let trustedTenants = dynamic([
+    "fabrikam", "adventureworks", "wingtiptoys"
+]);
+let maliciousTenants = dynamic([]);
+let tenantPattern = @"https?://([a-z0-9-]+?)(?:-my)?\.sharepoint\.com";
+//
+let spMsgs = materialize(
+    EmailUrlInfo
+    | where Timestamp > ago(lookback)
+    | where Url has "sharepoint.com"
+    | extend SharePointTenant = extract(tenantPattern, 1, tolower(Url))
+    | where isnotempty(SharePointTenant) and SharePointTenant !in (ownTenants)
+    | extend Sharer = extract(@"/personal/([^/]+)/", 1, tolower(Url))
+    | summarize Sharer = take_any(Sharer) by NetworkMessageId, SharePointTenant
+);
+// ZAP / removal post-delivery events per message
+let zapped = EmailPostDeliveryEvents
+    | where Timestamp > ago(lookback)
+    | where ActionType has "ZAP" or Action has "delete"        // vocabulary: probe P2
+    | distinct NetworkMessageId
+    | extend WasZapped = 1;
+// Blocked clicks per message
+let blockedClicks = UrlClickEvents
+    | where Timestamp > ago(lookback)
+    | where Url has "sharepoint.com"
+    | summarize MsgBlockedClicks = countif(ActionType == "ClickBlocked") by NetworkMessageId;
+//
+spMsgs
+| join kind=inner (
+    EmailEvents
+    | where Timestamp > ago(lookback)
+    | where EmailDirection == "Inbound"
+    | project NetworkMessageId, RecipientEmailAddress, Subject, DeliveryAction, ThreatTypes, Timestamp
+  ) on NetworkMessageId
+| join kind=leftouter zapped on NetworkMessageId
+| join kind=leftouter blockedClicks on NetworkMessageId
+| extend WasZapped = coalesce(WasZapped, 0),
+         MsgBlockedClicks = coalesce(MsgBlockedClicks, 0)
+| summarize
+    Msgs             = dcount(NetworkMessageId),
+    Recipients       = dcount(RecipientEmailAddress),
+    ThreatMsgs       = dcountif(NetworkMessageId, isnotempty(ThreatTypes)),
+    PhishVerdicts    = dcountif(NetworkMessageId, ThreatTypes has "Phish"),
+    MalwareVerdicts  = dcountif(NetworkMessageId, ThreatTypes has "Malware"),
+    ZappedMsgs       = dcountif(NetworkMessageId, WasZapped == 1),
+    BlockedAtDelivery = dcountif(NetworkMessageId, DeliveryAction in ("Blocked", "Replaced")),
+    BlockedClickMsgs = dcountif(NetworkMessageId, MsgBlockedClicks > 0),
+    BadSharers       = make_set_if(Sharer, isnotempty(ThreatTypes) or WasZapped == 1, 10),
+    SampleSubjects   = make_set(Subject, 10),
+    FirstSeen        = min(Timestamp),
+    LastSeen         = max(Timestamp)
+    by SharePointTenant
+| extend BadEvidence = ThreatMsgs + ZappedMsgs + BlockedClickMsgs + BlockedAtDelivery
+| where BadEvidence >= minBadEvidence or PhishVerdicts >= 1
+| where SharePointTenant !in (maliciousTenants)      // already listed
+| extend ConflictWarning = iff(SharePointTenant in (trustedTenants),
+    "ON TRUSTED LIST - check dossier per-sharer view; may be one compromised account, not a bad tenant",
+    "")
+| extend PasteLine = strcat('    "', SharePointTenant,
+    '", // added ', format_datetime(now(), "yyyy-MM-dd"),
+    ', INC-____, evidence 30d: ', tostring(ThreatMsgs), ' threat verdicts / ',
+    tostring(ZappedMsgs), ' ZAPed / ', tostring(BlockedClickMsgs), ' blocked-click msgs')
+| project SharePointTenant, ConflictWarning, BadEvidence, ThreatMsgs, PhishVerdicts,
+    MalwareVerdicts, ZappedMsgs, BlockedAtDelivery, BlockedClickMsgs,
+    Msgs, Recipients, BadSharers, SampleSubjects, FirstSeen, LastSeen, PasteLine
+| order by BadEvidence desc, Msgs desc

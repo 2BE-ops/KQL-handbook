@@ -1,0 +1,116 @@
+// ============================================================================
+// detection/2 — TENANT DOSSIER: Everything we know about one SP tenant
+// TRACK    : detection (vets list candidates; also jumped into mid-incident
+//            from any incident stage)
+// FEEDS    : the list decisions — vet every candidate from 1 here before its
+//            PasteLine (TrustedPasteLine in 1, or 3's output) is pasted into
+//            00 — including the edge case where ONE sharer is bad on an
+//            otherwise legit tenant (section 3 shows the per-sharer
+//            breakdown) — and incident triage (profile the attacking tenant
+//            on one screen, straight from incident/1a/1b or incident/2).
+// ----------------------------------------------------------------------------
+// Question : For ONE SharePoint tenant: full 30-day profile — mail volume,
+//            senders, sharers, subjects, threat verdicts, clicks, and files
+//            our devices downloaded from it. Legit or not gets decided on
+//            evidence, not vibes.
+// Surface  : Advanced Hunting, run manually
+// Tables   : EmailUrlInfo, EmailEvents, UrlClickEvents, DeviceFileEvents (MDE)
+// Input    : targetTenant — canonical name (lowercase, no -my).
+// Output   : Sectioned dossier: Section | Item | Count | Detail | First | Last.
+// Allowlist test (all must hold):
+//   - 1-Overview: multiple senders, spread over 14+ days, zero threat verdicts
+//   - 5-Threats : empty
+//   - 6-Clicks  : no ClickBlocked rows
+//   - 7-Downloads: no executable/script/container pulls (exe, js, ps1, iso, zip class)
+// ============================================================================
+let lookback = 30d;                       // AH retention cap
+let targetTenant = "contoso";             // ← set me (canonical, no -my)
+let tenantPattern = @"https?://([a-z0-9-]+?)(?:-my)?\.sharepoint\.com";
+//
+let urls = materialize(
+    EmailUrlInfo
+    | where Timestamp > ago(lookback)
+    | where Url has "sharepoint.com"
+    | extend SpTenant = extract(tenantPattern, 1, tolower(Url))
+    | where SpTenant =~ targetTenant
+    | extend Sharer = extract(@"/personal/([^/]+)/", 1, tolower(Url))
+    | project UrlTime = Timestamp, NetworkMessageId, Url, Sharer);
+let mail = materialize(
+    urls
+    | distinct NetworkMessageId
+    | join kind=inner (
+        EmailEvents
+        | where Timestamp > ago(lookback)
+      ) on NetworkMessageId);
+//
+let sOverview = mail
+    | summarize Msgs      = dcount(NetworkMessageId),
+                Recips    = dcount(RecipientEmailAddress),
+                Senders   = dcount(SenderFromAddress),
+                Delivered = countif(DeliveryAction == "Delivered"),
+                Threats   = countif(isnotempty(ThreatTypes)),
+                FirstSeen = min(Timestamp),
+                LastSeen  = max(Timestamp)
+    | extend Section = "1-Overview", Item = "30d totals", Count = tolong(Msgs),
+             Detail = strcat(tostring(Recips), " recipients / ",
+                             tostring(Senders), " senders / ",
+                             tostring(Delivered), " delivered / ",
+                             tostring(Threats), " with threat verdicts / span ",
+                             tostring(datetime_diff('day', LastSeen, FirstSeen)), "d")
+    | project Section, Item, Count, Detail, FirstSeen, LastSeen;
+let sSenders = mail
+    | summarize Count = tolong(dcount(NetworkMessageId)),
+                Detail0 = make_set(Subject, 3),
+                FirstSeen = min(Timestamp), LastSeen = max(Timestamp)
+              by Item = SenderFromAddress
+    | extend Section = "2-Senders", Detail = tostring(Detail0)
+    | project Section, Item, Count, Detail, FirstSeen, LastSeen;
+let sSharers = urls
+    | where isnotempty(Sharer)
+    | summarize Count = tolong(dcount(NetworkMessageId)),
+                FirstSeen = min(UrlTime), LastSeen = max(UrlTime)
+              by Item = Sharer
+    | extend Section = "3-Sharers (/personal/)", Detail = ""
+    | project Section, Item, Count, Detail, FirstSeen, LastSeen;
+let sSubjects = mail
+    | summarize Count = tolong(dcount(NetworkMessageId)),
+                FirstSeen = min(Timestamp), LastSeen = max(Timestamp)
+              by Item = Subject
+    | extend Section = "4-Subjects", Detail = ""
+    | project Section, Item, Count, Detail, FirstSeen, LastSeen;
+let sThreats = mail
+    | where isnotempty(ThreatTypes)
+    | summarize Count = tolong(dcount(NetworkMessageId)),
+                Detail0 = make_set(Subject, 5),
+                FirstSeen = min(Timestamp), LastSeen = max(Timestamp)
+              by Item = tostring(ThreatTypes)
+    | extend Section = "5-Threats", Detail = tostring(Detail0)
+    | project Section, Item, Count, Detail, FirstSeen, LastSeen;
+let sClicks = UrlClickEvents
+    | where Timestamp > ago(lookback)
+    | where Url has "sharepoint.com"
+    | extend SpTenant = extract(tenantPattern, 1, tolower(Url))
+    | where SpTenant =~ targetTenant
+    | summarize Count = tolong(count()),
+                Detail0 = make_set(tolower(AccountUpn), 10),
+                FirstSeen = min(Timestamp), LastSeen = max(Timestamp)
+              by Item = ActionType
+    | extend Section = "6-Clicks", Detail = tostring(Detail0)
+    | project Section, Item, Count, Detail, FirstSeen, LastSeen;
+// MDE leg — comment out if Device tables are unavailable:
+let sDownloads = DeviceFileEvents
+    | where Timestamp > ago(lookback)
+    | where FileOriginUrl has "sharepoint.com" or FileOriginReferrerUrl has "sharepoint.com"
+    | extend SpTenant = coalesce(
+        extract(tenantPattern, 1, tolower(FileOriginUrl)),
+        extract(tenantPattern, 1, tolower(FileOriginReferrerUrl)))
+    | where SpTenant =~ targetTenant
+    | summarize Count = tolong(count()),
+                Detail0 = make_set(DeviceName, 5),
+                FirstSeen = min(Timestamp), LastSeen = max(Timestamp)
+              by Item = FileName
+    | extend Section = "7-Downloads", Detail = tostring(Detail0)
+    | project Section, Item, Count, Detail, FirstSeen, LastSeen;
+//
+union sOverview, sSenders, sSharers, sSubjects, sThreats, sClicks, sDownloads
+| order by Section asc, Count desc

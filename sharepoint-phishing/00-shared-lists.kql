@@ -1,0 +1,75 @@
+// ============================================================================
+// 00 — SHARED LISTS for the SharePoint-phishing chapter
+// ----------------------------------------------------------------------------
+// Single source of truth. Advanced Hunting has no include mechanism:
+// copy the block you need into a query, and when you edit a list here,
+// re-paste it into every query that embeds it (each .kql header says which
+// lists it uses).
+//
+// CONVENTION: tenant names are CANONICAL — lowercase, "-my" suffix stripped.
+// The standard extraction pattern below strips "-my" for you, so allowlists
+// never need both "contoso" and "contoso-my".
+// ============================================================================
+
+// --- Standard tenant-extraction patterns ------------------------------------
+// From a full URL (EmailUrlInfo.Url, UrlClickEvents.Url):
+let spTenantPattern = @"https?://([a-z0-9-]+?)(?:-my)?\.sharepoint\.com";
+// From a bare host (EmailUrlInfo.UrlDomain):
+let spTenantDomainPattern = @"^([a-z0-9-]+?)(?:-my)?\.sharepoint\.com$";
+// Usage: | extend SharePointTenant = extract(spTenantPattern, 1, tolower(Url))
+
+// --- Our own tenant ----------------------------------------------------------
+// (Placeholder org throughout this repo: "contoso". Swap in your own values.)
+let ownTenants = dynamic(["contoso"]);
+let ownTenantString = "contoso";                         // for lookalike checks
+let ownOrgNameTokens = dynamic(["contoso corporation", "contoso corp"]);
+// Accepted email domains for our org (verify this list against EAC):
+let ownEmailDomains = dynamic(["contoso.com", "contoso.org"]);
+
+// ============================================================================
+// TENANT CLASSIFICATION LISTS — the heart of the detection track
+// ----------------------------------------------------------------------------
+// Built over time by detection/1 (review queue) → detection/2 (dossier vet)
+// → paste-ready entries (TrustedPasteLine in detection/1; detection/3 for
+// malicious). Consumed by detection/0a (malicious list only),
+// detection/0b, incident/1a, incident/1b, detection/1, detection/3. After
+// editing here, re-paste into every consumer (the Embeds: header line says
+// which) — 0b/incident-1b are MIRROR twins: logic/list changes go to both.
+// Rules:
+//   - Provenance is mandatory:  "tenant", // added YYYY-MM-DD, evidence/INC ref
+//   - Trusted ≠ immune: a trusted tenant can still host ONE compromised
+//     sharer — incident/1a surfaces trusted single-sharer fan-out, 1b's
+//     pivoted gates cover it behaviourally, and incident/2's targetSharer
+//     scopes the containment.
+//   - Malicious entries ALERT (detection/0a instantly, 0b gate-bypass;
+//     P0/P1 in incident/1a/1b); nothing auto-blocks.
+//   - These lists outlive the 30-day AH retention window — they are memory,
+//     not config. Never prune silently; retire entries to a dated comment.
+// ============================================================================
+let trustedTenants = dynamic([
+    // Placeholder examples showing the mandatory provenance format —
+    // replace with your own vetted partner tenants:
+    "fabrikam",       // added 2026-07-19, clean baseline: 124 msgs / 18 senders / 27d span — vetted via dossier
+    "adventureworks", // added 2026-07-19, clean baseline: 61 msgs / 9 senders / 22d span — vetted via dossier
+    "wingtiptoys"     // added 2026-07-26, long-standing partner org, dossier clean
+]);
+let maliciousTenants = dynamic([
+    // "eviltenant", // added YYYY-MM-DD, INC-nnnn, campaign summary
+]);
+
+// --- Phish-shaped subject terms (for hunting, not detection gating) ----------
+let phishSubjectTerms = dynamic([
+    "shared", "sent you", "document", "invoice", "view file", "review",
+    "secure", "signed", "esign", "docusign", "action required", "fax",
+    "contract", "payment", "remittance", "purchase order", "rfq"
+]);
+
+// NOTE: finer-grained watchlists (bad sharer UPNs, redirect/harvest hosts)
+// were retired with the parked/ folder in iteration 5 — git history has the
+// machinery if that program ever starts.
+
+// --- Internal bulk sharers (comms/HR/newsletters) ------------------------------
+// Suppresses false positives in incident/5's unseeded detector mode. UPNs.
+let internalSharerAllowlist = dynamic([
+    // "internal.comms@contoso.com",
+]);

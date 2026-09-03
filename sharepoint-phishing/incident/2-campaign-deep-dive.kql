@@ -1,0 +1,80 @@
+// ============================================================================
+// incident/2 — DEEP DIVE + CONTAIN: One campaign, one row per mailbox copy
+// FLOW     : 1A or 1B (paste their PasteKeys cell — tenant + sharer) — or
+//            the tenant named by a detection/0a or 0b alert
+//            ─▶ THIS ─▶ select rows → "Take actions" → soft delete / move
+// ----------------------------------------------------------------------------
+// Question : Every copy of this campaign, per recipient — who has it, where
+//            it sits, who clicked — as rows you can ACT on directly.
+// Surface  : Advanced Hunting, manual. Select rows → Take actions. Email
+//            actions light up because every row carries NetworkMessageId +
+//            RecipientEmailAddress. DO NOT add a summarize to this query —
+//            aggregation strips those columns and kills the action button.
+//            (Volume here is intentional: one row per mailbox copy IS the
+//            containment surface. Triage happened in 1A/1B.)
+// Tables   : EmailEvents, EmailUrlInfo, UrlClickEvents
+// Inputs   : targetTenant  (required — from 1A/1B's PasteKeys or the alert)
+//            targetSharer  (optional — from 1A's TopSharer / 1B's Sharers.
+//                           Comes free in PasteKeys when unambiguous. SET THIS
+//                           for the compromised-legit-tenant case: containment
+//                           then only touches that sharer's lure, never the
+//                           tenant's legitimate correspondence.)
+//            subjectContains (optional extra narrowing)
+// Next     : 3 (verify, same keys) · 4 (check clickers, same keys)
+// ============================================================================
+let lookback        = 7d;                 // up to 30d (AH retention cap)
+let targetTenant    = "";                 // ← REQUIRED, canonical (no -my)
+let targetSharer    = "";                 // ← optional /personal/ segment, e.g. "j_doe_evilcorp_com"
+let subjectContains = "";                 // ← optional
+let tenantPattern   = @"https?://([a-z0-9-]+?)(?:-my)?\.sharepoint\.com";
+//
+// Campaign messages: external SP links matching the keys
+let campaignMsgs =
+    EmailUrlInfo
+    | where Timestamp > ago(lookback)
+    | where Url has "sharepoint.com"
+    | extend SharePointTenant = extract(tenantPattern, 1, tolower(Url))
+    | where SharePointTenant =~ targetTenant
+    | where isempty(targetSharer) or Url contains targetSharer
+    | extend SharerKey = coalesce(
+        extract(@"/personal/([^/]+)/", 1, tolower(Url)),
+        strcat("site:", extract(@"\.sharepoint\.com/sites/([^/]+)/", 1, tolower(Url))))
+    | summarize SpUrl = take_any(Url), SharerKey = take_any(SharerKey)
+              by NetworkMessageId;
+//
+// Latest click per (message, clicker) — matched to recipients below
+let recipientClicks =
+    UrlClickEvents
+    | where Timestamp > ago(lookback)
+    | where Workload == "Email"
+    | extend ClickUpn = tolower(AccountUpn)
+    | summarize arg_max(Timestamp, ActionType, IsClickedThrough)
+              by NetworkMessageId, ClickUpn
+    | project NetworkMessageId, ClickUpn,
+              ClickAction = ActionType, ClickedThrough = IsClickedThrough,
+              ClickTime = Timestamp;
+//
+EmailEvents
+| where Timestamp > ago(lookback)
+| join kind=inner campaignMsgs on NetworkMessageId
+| where isempty(subjectContains) or Subject contains subjectContains
+| extend RecipientKey = tolower(RecipientEmailAddress)
+| join kind=leftouter recipientClicks
+    on NetworkMessageId, $left.RecipientKey == $right.ClickUpn
+| extend Priority = case(
+    ClickedThrough == true,
+        "P0 - Clicked through the warning",
+    ClickAction == "ClickAllowed",
+        "P1 - Reached the lure",
+    LatestDeliveryLocation startswith "Inbox"
+        or (isempty(LatestDeliveryLocation) and DeliveryLocation startswith "Inbox"),
+        "P2 - Live in Inbox",
+    DeliveryAction == "Delivered",
+        "P3 - Delivered (since moved/junked)",
+        "P4 - Junked/blocked at delivery")
+| project Priority, Timestamp, NetworkMessageId, RecipientEmailAddress,
+    Subject, SenderFromAddress, SenderMailFromAddress,
+    DeliveryAction, DeliveryLocation, LatestDeliveryAction, LatestDeliveryLocation,
+    ThreatTypes, SharerKey, SpUrl,
+    ClickAction, ClickedThrough, ClickTime
+| order by Priority asc, Timestamp desc

@@ -1,0 +1,142 @@
+// ============================================================================
+// incident/7 — POST-CLICK CHAIN: what did the click actually LEAD to?
+// FLOW     : 2 or 4 (same keys) ─▶ THIS ─▶ verdict feeds back into 4's
+//            priorities and, optionally, a redirect-host IOC
+// ----------------------------------------------------------------------------
+// Why this exists : the SharePoint file is almost never the attack. It is a
+//            decoy document whose only job is to carry a link to the real
+//            second stage. Two things follow from that, and neither was
+//            visible anywhere else in the chapter:
+//
+//            1. SHAPE. Credential harvest and payload delivery need opposite
+//               responses, and until you know which one this is you are
+//               guessing. Section 3 answers it: was a file actually pulled
+//               down from the tenant, or did the chain run on to a web host?
+//               Every other query here quietly assumes credential harvest.
+//            2. THE BETTER IOC. The harvest host is shared across the whole
+//               campaign and survives tenant rotation; the tenant slug does
+//               not. This gives you the host.
+//
+// Question : For clicks on this campaign — what did the redirect chain go on
+//            to, what did the clicker's device fetch next, and did anyone
+//            download the payload?
+// Surface  : Advanced Hunting, manual, on any campaign with allowed clicks.
+// Tables   : UrlClickEvents, DeviceNetworkEvents, DeviceFileEvents, EmailEvents
+// Inputs   : same keys as 4 — targetTenant (+ optional targetSharer), or
+//            targetSender / targetSubject for a non-SP phish shape.
+// Reading  : Section 2 is the money column. A repeated non-Microsoft host
+//            appearing minutes after multiple clicks is the harvest page —
+//            confirm it manually, then it is worth listing.
+// Caveats  : Coverage is genuinely partial and it matters here.
+//            - UrlClickEvents only sees Safe Links-wrapped URLs, so the
+//              browser's onward navigation does NOT appear unless it was
+//              itself a wrapped link. UrlChain (redirects recorded at click
+//              time) partly covers this — pending probe P9 for whether it is
+//              populated in this tenant.
+//            - DeviceNetworkEvents only covers ONBOARDED devices. A click from
+//              an unmanaged personal phone leaves nothing here. An empty
+//              result is NOT evidence the click was harmless.
+// Next     : confirmed harvest host ─▶ optional IOC list revival (see
+//            00-shared-lists NOTE) · payload confirmed ─▶ this is not just a
+//            phish chapter problem, treat as malware delivery
+// ============================================================================
+let lookback     = 7d;                    // up to 30d
+let chainWindow  = 30m;                   // how long after a click to follow the trail
+let targetTenant  = "";                   // ← key: SP tenant slug (canonical, no -my)
+let targetSharer  = "";                   // ← optional /personal/ refinement
+let targetSender  = "";                   // ← key: confirmed-malicious sender
+let targetSubject = "";                   // ← key: confirmed-malicious subject fragment
+let tenantPattern = @"https?://([a-z0-9-]+?)(?:-my)?\.sharepoint\.com";
+let keysSet       = isnotempty(targetTenant) or isnotempty(targetSender) or isnotempty(targetSubject);
+// Hosts that are never the second stage — keep this tight, an over-broad
+// exclusion list is how you miss the harvest page.
+let benignHosts = dynamic([
+    "sharepoint.com", "microsoft.com", "microsoftonline.com", "office.com",
+    "office365.com", "live.com", "msftauth.net", "msauth.net", "outlook.com",
+    "onedrive.com", "windows.net", "azureedge.net", "aka.ms", "contoso.com",
+    "contoso.org"   // ← your own domains belong here too
+]);
+//
+// ---- The campaign's clicks -------------------------------------------------------
+let clicks = materialize(
+    UrlClickEvents
+    | where Timestamp > ago(lookback)
+    | where keysSet
+    | where Workload == "Email"
+    | where ActionType == "ClickAllowed" or IsClickedThrough == true
+    | extend SharePointTenant = extract(tenantPattern, 1, tolower(Url))
+    | where isempty(targetTenant) or SharePointTenant =~ targetTenant
+    | where isempty(targetSharer) or Url contains targetSharer
+    | extend AccountUpn = tolower(AccountUpn)
+    | join kind=leftouter (
+        EmailEvents
+        | where Timestamp > ago(lookback)
+        | where isnotempty(NetworkMessageId)
+        | distinct NetworkMessageId, Subject, SenderFromAddress
+      ) on NetworkMessageId
+    | where isempty(targetSender)  or SenderFromAddress =~ targetSender
+    | where isempty(targetSubject) or Subject contains targetSubject
+    | project ClickTime = Timestamp, AccountUpn, Url, UrlChain, NetworkMessageId
+);
+let clickers = clicks | distinct AccountUpn;
+//
+// ---- Section 1: redirect chain recorded AT click time (probe P9) -----------------
+// UrlChain is the cheapest possible source for the second stage: it is the
+// redirect sequence Safe Links itself followed. If it is populated, the
+// harvest host is often sitting in it already.
+let sChain = clicks
+    | where isnotempty(UrlChain)
+    | mv-expand ChainUrl = UrlChain to typeof(string)
+    | extend ChainHost = tolower(tostring(parse_url(ChainUrl).Host))
+    | where isnotempty(ChainHost)
+    | where not(ChainHost has_any (benignHosts))
+    | summarize Count = tolong(count()),
+                Clickers = dcount(AccountUpn),
+                Detail0 = make_set(ChainUrl, 5),
+                FirstSeen = min(ClickTime), LastSeen = max(ClickTime)
+              by Item = ChainHost
+    | extend Section = "1-RedirectChain", Detail = tostring(Detail0)
+    | project Section, Item, Count, Clickers, Detail, FirstSeen, LastSeen;
+//
+// ---- Section 2: what the clicker's device fetched next (onboarded devices only) ---
+let sNext = clicks
+    | join kind=inner (
+        DeviceNetworkEvents
+        | where Timestamp > ago(lookback)
+        | where isnotempty(RemoteUrl)
+        | extend AccountUpn = tolower(InitiatingProcessAccountUpn)
+        | where AccountUpn in (clickers)
+        | project NetTime = Timestamp, AccountUpn, RemoteUrl, DeviceName
+      ) on AccountUpn
+    | where NetTime between (ClickTime .. (ClickTime + chainWindow))
+    | extend NextHost = tolower(tostring(parse_url(RemoteUrl).Host))
+    | where isnotempty(NextHost)
+    | where not(NextHost has_any (benignHosts))
+    | summarize Count = tolong(count()),
+                Clickers = dcount(AccountUpn),
+                Detail0 = make_set(DeviceName, 5),
+                FirstSeen = min(NetTime), LastSeen = max(NetTime)
+              by Item = NextHost
+    | extend Section = "2-NextHop", Detail = tostring(Detail0)
+    | project Section, Item, Count, Clickers, Detail, FirstSeen, LastSeen;
+//
+// ---- Section 3: SHAPE — did anything actually download from the tenant? ----------
+// Present ⇒ payload delivery, and this stops being a credential-phish problem.
+// Absent  ⇒ credential harvest (the working assumption everywhere else).
+let sPayload = DeviceFileEvents
+    | where Timestamp > ago(lookback)
+    | where FileOriginUrl has "sharepoint.com" or FileOriginReferrerUrl has "sharepoint.com"
+    | extend SpTenant = coalesce(
+        extract(tenantPattern, 1, tolower(FileOriginUrl)),
+        extract(tenantPattern, 1, tolower(FileOriginReferrerUrl)))
+    | where isempty(targetTenant) or SpTenant =~ targetTenant
+    | summarize Count = tolong(count()),
+                Clickers = dcount(InitiatingProcessAccountUpn),
+                Detail0 = make_set(DeviceName, 5),
+                FirstSeen = min(Timestamp), LastSeen = max(Timestamp)
+              by Item = strcat(FileName, "  [", SHA256, "]")
+    | extend Section = "3-PayloadDownload", Detail = tostring(Detail0)
+    | project Section, Item, Count, Clickers, Detail, FirstSeen, LastSeen;
+//
+union sChain, sNext, sPayload
+| order by Section asc, Clickers desc, Count desc

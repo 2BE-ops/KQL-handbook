@@ -1,0 +1,153 @@
+// ============================================================================
+// detection/1 — TENANT REVIEW QUEUE: weekly inventory + trusted paste lines
+// FLOW     : run weekly ─▶ vet interesting tenants with 2 (dossier) ─▶
+//            trusted entries: copy TrustedPasteLine straight from THIS;
+//            malicious entries: run 3 ─▶ paste into 00-shared-lists ─▶
+//            re-paste lists into consumers (0a/0b rules, incident/1a/1b,
+//            this, 3) ─▶ the rules get sharper
+// ----------------------------------------------------------------------------
+// Question : Which external SP tenants mailed us that are in NEITHER list yet,
+//            and what does their behaviour suggest? One row per tenant with
+//            the evidence needed to classify it — plus a ready-made
+//            trustedTenants PasteLine whenever the clean baseline already
+//            holds (formerly lists/2's job; a quiet-but-established tenant
+//            simply surfaces the next week it mails us).
+// Surface  : Advanced Hunting, manual — weekly
+// Tables   : EmailEvents, EmailUrlInfo, UrlClickEvents
+// Columns  : LooksEstablished = clean-traffic baseline BEFORE this window
+//            (the strongest pro-trust evidence; Baseline* columns carry the
+//            numbers). TopSharer/TopSharerRecipients = single-sharer fan-out
+//            (the compromised-partner tell — one bad user on a legit
+//            domain). ReviewHint suggests a direction, the dossier decides.
+// Embeds   : ownTenants, trustedTenants, maliciousTenants, phishSubjectTerms
+// ============================================================================
+let lookback = 7d;
+let showAll  = false;              // true = include already-listed tenants too
+let sharerFanoutAlert = 10;
+let ownTenants = dynamic(["contoso"]);
+// ---- Classification lists — sync from 00-shared-lists.kql -------------------
+let trustedTenants = dynamic([
+    "fabrikam", "adventureworks", "wingtiptoys"
+]);
+let maliciousTenants = dynamic([]);
+let phishSubjectTerms = dynamic([
+    "shared", "sent you", "document", "invoice", "view file", "review",
+    "secure", "signed", "esign", "docusign", "action required", "fax",
+    "contract", "payment", "remittance", "purchase order", "rfq"
+]);
+let tenantPattern = @"https?://([a-z0-9-]+?)(?:-my)?\.sharepoint\.com";
+// Behavioural "established" baseline: clean traffic BEFORE the lookback window
+let baselineStart = 30d;
+let minBaselineEmails = 10;
+let minBaselineRecipients = 3;
+let minBaselineSenders = 3;
+let minBaselineDaySpan = 14;
+//
+let establishedTenants = materialize(
+    EmailUrlInfo
+    | where Timestamp between (ago(baselineStart) .. ago(lookback))
+    | where Url has "sharepoint.com"
+    | extend SharePointTenant = extract(tenantPattern, 1, tolower(Url))
+    | where isnotempty(SharePointTenant) and SharePointTenant !in (ownTenants)
+    | join kind=inner (
+        EmailEvents
+        | where Timestamp between (ago(baselineStart) .. ago(lookback))
+        | where EmailDirection == "Inbound" and DeliveryAction == "Delivered"
+        | where isempty(ThreatTypes)
+    ) on NetworkMessageId
+    | summarize
+        EmailCount       = dcount(NetworkMessageId),
+        UniqueRecipients = dcount(RecipientEmailAddress),
+        UniqueSenders    = dcount(SenderFromAddress),
+        DaySpan          = datetime_diff('day', max(Timestamp), min(Timestamp))
+        by SharePointTenant
+    | where EmailCount >= minBaselineEmails
+        and UniqueRecipients >= minBaselineRecipients
+        and UniqueSenders >= minBaselineSenders
+        and DaySpan >= minBaselineDaySpan
+    | project SharePointTenant, BaselineMsgs = EmailCount,
+              BaselineSenders = UniqueSenders, BaselineDaySpan = DaySpan
+);
+//
+let spMail = materialize(
+    EmailUrlInfo
+    | where Timestamp > ago(lookback)
+    | where Url has "sharepoint.com"
+    | extend SharePointTenant = extract(tenantPattern, 1, tolower(Url))
+    | where isnotempty(SharePointTenant) and SharePointTenant !in (ownTenants)
+    | extend Sharer = extract(@"/personal/([^/]+)/", 1, tolower(Url))
+    | summarize SampleUrl = take_any(Url), Sharer = take_any(Sharer)
+              by NetworkMessageId, SharePointTenant
+    | join kind=inner (
+        EmailEvents
+        | where Timestamp > ago(lookback)
+        | where EmailDirection == "Inbound"
+    ) on NetworkMessageId
+);
+let sharerFanout = spMail
+    | where isnotempty(Sharer)
+    | summarize FanOut = dcount(RecipientEmailAddress) by SharePointTenant, Sharer
+    | summarize arg_max(FanOut, Sharer) by SharePointTenant
+    | project SharePointTenant, TopSharerRecipients = FanOut, TopSharer = Sharer;
+let clicks = UrlClickEvents
+    | where Timestamp > ago(lookback)
+    | where Url has "sharepoint.com"
+    | extend SharePointTenant = extract(tenantPattern, 1, tolower(Url))
+    | where isnotempty(SharePointTenant) and SharePointTenant !in (ownTenants)
+    | summarize AllowedClicks = countif(ActionType == "ClickAllowed"),
+                BlockedClicks = countif(ActionType == "ClickBlocked")
+              by SharePointTenant;
+//
+spMail
+| summarize
+    EmailCount        = dcount(NetworkMessageId),
+    Recipients        = dcount(RecipientEmailAddress),
+    UniqueSenders     = dcount(SenderFromAddress),
+    UniqueSharers     = dcount(Sharer),
+    DeliveredCount    = dcountif(NetworkMessageId, DeliveryAction == "Delivered"),
+    ThreatMsgs        = dcountif(NetworkMessageId, isnotempty(ThreatTypes)),
+    PhishShapedMsgs   = dcountif(NetworkMessageId, Subject has_any (phishSubjectTerms)),
+    SampleSubjects    = make_set(Subject, 10),
+    SampleSenders     = make_set(SenderFromAddress, 10),
+    SampleUrl         = take_any(SampleUrl),
+    FirstSeen         = min(Timestamp),
+    LastSeen          = max(Timestamp)
+    by SharePointTenant
+| join kind=leftouter sharerFanout on SharePointTenant
+| join kind=leftouter clicks on SharePointTenant
+| join kind=leftouter establishedTenants on SharePointTenant
+| extend AllowedClicks = coalesce(AllowedClicks, 0),
+         BlockedClicks = coalesce(BlockedClicks, 0),
+         TopSharerRecipients = coalesce(TopSharerRecipients, 0)
+| extend Classification = case(
+    SharePointTenant in (maliciousTenants), "Malicious (listed)",
+    SharePointTenant in (trustedTenants),   "Trusted (listed)",
+                                            "Unknown")
+| where showAll or Classification == "Unknown"
+| extend LooksEstablished = isnotnull(BaselineMsgs)
+| extend ReviewHint = case(
+    ThreatMsgs > 0 or BlockedClicks > 0,
+        "Lean MALICIOUS - confirm with dossier (2), then 3",
+    TopSharerRecipients >= sharerFanoutAlert,
+        "Investigate NOW - single-sharer fan-out (incident/2 with TopSharer)",
+    LooksEstablished and UniqueSenders >= 3 and ThreatMsgs == 0 and BlockedClicks == 0,
+        "Lean TRUSTED - vet with dossier (2), copy TrustedPasteLine",
+    EmailCount <= 2,
+        "Too little traffic - leave unknown",
+        "Review with dossier (2)")
+| extend TrustedPasteLine = iff(
+    LooksEstablished and UniqueSenders >= 3 and ThreatMsgs == 0
+        and BlockedClicks == 0 and TopSharerRecipients < sharerFanoutAlert,
+    strcat('    "', SharePointTenant,
+        '", // added ', format_datetime(now(), "yyyy-MM-dd"),
+        ', clean baseline: ', tostring(BaselineMsgs), ' msgs / ',
+        tostring(BaselineSenders), ' senders / ', tostring(BaselineDaySpan),
+        'd span — vetted via dossier'),
+    "")
+| project ReviewHint, TrustedPasteLine, SharePointTenant, Classification,
+    LooksEstablished, BaselineMsgs, BaselineDaySpan,
+    EmailCount, Recipients, UniqueSenders, UniqueSharers, DeliveredCount,
+    ThreatMsgs, PhishShapedMsgs, AllowedClicks, BlockedClicks,
+    TopSharer, TopSharerRecipients,
+    SampleSubjects, SampleSenders, SampleUrl, FirstSeen, LastSeen
+| order by ThreatMsgs desc, TopSharerRecipients desc, EmailCount desc
